@@ -778,6 +778,8 @@ AGENT_INSTANCES = {} # stream_id -> agent instance (for cancel/interrupt)
 STREAM_PARTIAL_TEXT = {}  # stream_id -> str, accumulated tokens for cancel-preserve (reference #893)
 STREAM_SESSIONS = {}  # stream_id -> session_id, so cancel_stream can persist partial content
 STREAM_STEER_STATE = {}  # stream_id -> {"next_id": int, "pending": [steer_record, ...]}
+WORK_ITEMS = {}  # stream_id -> server-backed live work item for Tasks UI
+WORK_ITEMS_LOCK = threading.Lock()
 
 # session_id -> dict (in-memory cache, persisted to disk like webui)
 SESSIONS = {}
@@ -788,6 +790,116 @@ SESSION_ALIASES = {}
 SESSION_DIR = os.path.join(HERMES_HOME, "hermes-ui", "sessions")
 os.makedirs(SESSION_DIR, exist_ok=True)
 SESSION_ALIASES_FILE = os.path.join(HERMES_HOME, "hermes-ui", "session-aliases.json")
+WORK_ITEMS_FILE = os.path.join(HERMES_HOME, "hermes-ui", "work-items.json")
+
+
+def _utc_now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _save_work_items():
+    """Persist recent server-backed work items so the Tasks tab survives reloads."""
+    try:
+        os.makedirs(os.path.dirname(WORK_ITEMS_FILE), exist_ok=True)
+        with WORK_ITEMS_LOCK:
+            items = list(WORK_ITEMS.values())
+        now = time.time()
+        trimmed = []
+        for item in items:
+            updated_ts = item.get("_updated_ts") or now
+            status = str(item.get("status") or "")
+            # Keep active work plus one day of receipts/errors.
+            if status in ("running", "waiting") or (now - updated_ts) <= 24 * 60 * 60:
+                public = {k: v for k, v in item.items() if not str(k).startswith("_")}
+                public["_updated_ts"] = updated_ts
+                trimmed.append(public)
+        with open(WORK_ITEMS_FILE, "w", encoding="utf-8") as f:
+            json.dump(trimmed[-200:], f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[serve] WARNING: Failed to save work items: {e}", flush=True)
+
+
+def _load_work_items():
+    try:
+        if not os.path.exists(WORK_ITEMS_FILE):
+            return
+        with open(WORK_ITEMS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            return
+        now = time.time()
+        with WORK_ITEMS_LOCK:
+            WORK_ITEMS.clear()
+            for raw in data[-200:]:
+                if not isinstance(raw, dict):
+                    continue
+                stream_id = str(raw.get("stream_id") or "")
+                if not stream_id:
+                    continue
+                updated_ts = float(raw.get("_updated_ts") or now)
+                if str(raw.get("status") or "") not in ("running", "waiting") and (now - updated_ts) > 24 * 60 * 60:
+                    continue
+                item = dict(raw)
+                item["_updated_ts"] = updated_ts
+                WORK_ITEMS[stream_id] = item
+    except Exception as e:
+        print(f"[serve] WARNING: Failed to load work items: {e}", flush=True)
+
+
+def _work_item_public(item):
+    return {k: v for k, v in (item or {}).items() if not str(k).startswith("_")}
+
+
+def _work_item_start(stream_id, session_id, title="", detail=""):
+    now = _utc_now_iso()
+    with WORK_ITEMS_LOCK:
+        WORK_ITEMS[stream_id] = {
+            "id": f"server:{stream_id}",
+            "stream_id": stream_id,
+            "session_id": session_id,
+            "kind": "Agent",
+            "status": "running",
+            "column": "active",
+            "title": (title or "Hermes is working")[:140],
+            "detail": (detail or "Live Hermes turn")[:240],
+            "tool_count": 0,
+            "created_at": now,
+            "updated_at": now,
+            "_updated_ts": time.time(),
+        }
+    _save_work_items()
+
+
+def _work_item_update(stream_id, **updates):
+    if not stream_id:
+        return
+    now = _utc_now_iso()
+    changed = False
+    with WORK_ITEMS_LOCK:
+        item = WORK_ITEMS.get(stream_id)
+        if item is None:
+            session_id = STREAM_SESSIONS.get(stream_id, "")
+            item = {
+                "id": f"server:{stream_id}",
+                "stream_id": stream_id,
+                "session_id": session_id,
+                "kind": "Agent",
+                "status": "running",
+                "column": "active",
+                "title": "Hermes is working",
+                "detail": "",
+                "tool_count": 0,
+                "created_at": now,
+            }
+            WORK_ITEMS[stream_id] = item
+        for key, value in updates.items():
+            if value is not None:
+                item[key] = value
+                changed = True
+        item["updated_at"] = now
+        item["_updated_ts"] = time.time()
+    if changed:
+        _save_work_items()
 
 
 def _load_session_aliases():
@@ -837,6 +949,7 @@ def _alias_session_id(old_sid, new_sid):
 
 
 _load_session_aliases()
+_load_work_items()
 
 
 def _save_session(session_id, session_data):
@@ -1104,6 +1217,14 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
                     args_snap[str(k)] = _snap_tool_arg(v)
 
             if event_type in (None, "tool.started"):
+                _work_item_update(
+                    stream_id,
+                    kind="Tool",
+                    status="running",
+                    column="active",
+                    title=str(preview or name or "Tool running")[:140],
+                    detail=str(name or "")[:240],
+                )
                 put("tool", {"name": name, "preview": preview, "args": args_snap})
             elif event_type == "tool.completed":
                 result_snap = None
@@ -1115,6 +1236,17 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
                     "name": name, "preview": preview, "args": args_snap,
                     "duration": kwargs.get("duration"), "result": result_snap,
                 })
+                with WORK_ITEMS_LOCK:
+                    _next_tool_count = WORK_ITEMS.get(stream_id, {}).get("tool_count", 0) + 1
+                _work_item_update(
+                    stream_id,
+                    kind="Tool",
+                    status="running",
+                    column="active",
+                    title=str(preview or name or "Tool finished")[:140],
+                    detail="Tool finished; Hermes is continuing",
+                    tool_count=_next_tool_count,
+                )
                 # Signal the periodic checkpoint thread that real progress has
                 # been made (Issue #765). The agent works on an internal copy
                 # of s.messages during run_conversation, so watching
@@ -1431,11 +1563,27 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
                 or "invalid api key" in _err_str.lower()
             )
             if _is_auth:
+                _work_item_update(
+                    stream_id,
+                    kind="Agent",
+                    status="error",
+                    column="blocked",
+                    title="Agent authentication failed",
+                    detail=_err_str[:240] or "Check your API key.",
+                )
                 put("apperror", {
                     "message": _err_str or "Authentication failed — check your API key.",
                     "type": "auth_mismatch",
                 })
             else:
+                _work_item_update(
+                    stream_id,
+                    kind="Agent",
+                    status="error",
+                    column="blocked",
+                    title="Agent returned no response",
+                    detail=_err_str[:240] or "Check your model/API configuration.",
+                )
                 put("apperror", {
                     "message": _err_str or "The agent returned no response. Check your API key and model selection.",
                     "type": "no_response",
@@ -1498,6 +1646,15 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
                 ],
             })
 
+        _work_item_update(
+            stream_id,
+            kind="Agent",
+            status="done",
+            column="done",
+            title="Reply complete",
+            detail=f"{input_tokens or 0} input tokens, {output_tokens or 0} output tokens",
+            completed_at=_utc_now_iso(),
+        )
         put("done", {
             "session": {
                 "session_id": session_id,
@@ -1513,6 +1670,14 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
 
     except Exception as e:
         print(f"[serve] stream error:\n{traceback.format_exc()}", flush=True)
+        _work_item_update(
+            stream_id,
+            kind="Agent",
+            status="error",
+            column="blocked",
+            title="Stream error",
+            detail=str(e)[:240],
+        )
         put("error", {"message": str(e)})
     finally:
         # Stop periodic checkpoint thread if it was started (Issue #765)
@@ -1600,6 +1765,16 @@ def cancel_stream(stream_id):
                 _save_session(_cancel_session_id, sess)
     except Exception as _e:
         print(f"[serve] WARNING: cancel-preserve failed for {stream_id}: {_e}", flush=True)
+
+    _work_item_update(
+        stream_id,
+        kind="Agent",
+        status="cancelled",
+        column="blocked",
+        title="Task cancelled",
+        detail="Stopped by user",
+        completed_at=_utc_now_iso(),
+    )
 
     # Push the cancel event last, bundling the updated session so the
     # frontend can render the preserved _partial + _error messages without
@@ -1820,6 +1995,20 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
         q = queue.Queue()
         with STREAMS_LOCK:
             STREAMS[stream_id] = q
+        try:
+            last_user = ""
+            for _m in reversed(messages):
+                if isinstance(_m, dict) and _m.get("role") == "user":
+                    last_user = str(_m.get("content") or "")
+                    break
+            _work_item_start(
+                stream_id,
+                session_id,
+                title=(last_user[:120] or "Hermes is working"),
+                detail="Live chat turn",
+            )
+        except Exception:
+            pass
 
         thr = threading.Thread(
             target=_run_agent_streaming,
@@ -1870,6 +2059,51 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         stream_id = parse_qs(parsed.query).get("stream_id", [""])[0]
         self._json({"active": stream_id in STREAMS, "stream_id": stream_id})
+
+    def _handle_work_items(self):
+        """Return recent server-backed live/background work for the Tasks tab."""
+        now = time.time()
+        items = []
+        changed = False
+        with WORK_ITEMS_LOCK:
+            for stream_id, item in list(WORK_ITEMS.items()):
+                updated_ts = item.get("_updated_ts") or now
+                status = str(item.get("status") or "")
+                if status not in ("running", "waiting") and (now - updated_ts) > 24 * 60 * 60:
+                    WORK_ITEMS.pop(stream_id, None)
+                    changed = True
+                    continue
+                items.append(_work_item_public(item))
+        if changed:
+            _save_work_items()
+        items.sort(key=lambda item: item.get("updated_at") or item.get("created_at") or "", reverse=True)
+        self._json({"ok": True, "items": items[:200]})
+
+    def _handle_work_item_update(self):
+        """Manual Tasks board controls: dismiss or mark a server work item done."""
+        body = self._read_json_body_optional()
+        stream_id = str(body.get("stream_id") or "").strip()
+        action = str(body.get("action") or "").strip().lower()
+        if not stream_id:
+            return self._json({"ok": False, "error": "stream_id required"}, 400)
+        if action == "dismiss":
+            with WORK_ITEMS_LOCK:
+                removed = WORK_ITEMS.pop(stream_id, None) is not None
+            _save_work_items()
+            return self._json({"ok": True, "dismissed": removed})
+        if action == "done":
+            _work_item_update(
+                stream_id,
+                status="done",
+                column="done",
+                title=str(body.get("title") or "Marked done")[:140],
+                detail=str(body.get("detail") or "Marked done from Tasks")[:240],
+                completed_at=_utc_now_iso(),
+            )
+            with WORK_ITEMS_LOCK:
+                item = _work_item_public(WORK_ITEMS.get(stream_id))
+            return self._json({"ok": True, "item": item})
+        self._json({"ok": False, "error": "Unsupported action"}, 400)
 
     def _handle_chat_steer(self):
         """Inject a no-pause nudge into the live agent turn.
@@ -3048,6 +3282,8 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
             self._handle_health()
         elif self.path.startswith("/api/chat/stream/status"):
             self._handle_chat_stream_status()
+        elif self.path == "/api/work-items" or self.path.startswith("/api/work-items?"):
+            self._handle_work_items()
         elif self.path.startswith("/api/chat/stream"):
             self._handle_chat_stream()
         elif self.path.startswith("/api/chat/cancel"):
@@ -3110,6 +3346,8 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
             self._handle_cancel()
         elif self.path == "/api/chat/steer":
             self._handle_chat_steer()
+        elif self.path == "/api/work-items":
+            self._handle_work_item_update()
         elif self.path == "/v1/chat/completions" or self.path == "/api/chat":
             self._handle_chat_start()  # backwards compat — same two-step flow
         elif self.path.startswith("/terminal/exec"):

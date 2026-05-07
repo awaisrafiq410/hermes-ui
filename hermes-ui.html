@@ -640,6 +640,14 @@
     font-size: 12px;
     line-height: 1.35;
   }
+  .toolless-work-warning button {
+    margin-left: auto; flex: 0 0 auto; border: 1px solid rgba(232,176,74,0.38);
+    background: rgba(232,176,74,0.10); color: #f5d18a; border-radius: 8px;
+    padding: 5px 8px; font-size: 11px; font-weight: 800; cursor: pointer;
+  }
+  .toolless-work-warning button:hover {
+    background: rgba(232,176,74,0.18);
+  }
   .toolless-work-warning strong {
     color: var(--warning);
     font-weight: 800;
@@ -1321,6 +1329,21 @@
     background: rgba(255,255,255,0.025);
   }
   .task-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+  .task-card-actions {
+    display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px;
+  }
+  .task-card-action {
+    border: 1px solid var(--glass-border); border-radius: 8px;
+    background: rgba(255,255,255,0.035); color: var(--text-secondary);
+    padding: 4px 7px; font-size: 10px; font-weight: 750; cursor: pointer;
+  }
+  .task-card-action:hover {
+    color: var(--text-primary); background: rgba(255,255,255,0.065);
+  }
+  .task-card-action.primary {
+    color: #b8f0d0; border-color: rgba(68,216,138,0.28);
+    background: rgba(68,216,138,0.08);
+  }
   .skills-safety-card {
     border: 1px solid rgba(245,185,77,0.26); border-radius: 12px;
     background: linear-gradient(135deg, rgba(245,185,77,0.08), rgba(124,111,224,0.045));
@@ -4080,6 +4103,14 @@ function extractTodoListFromText(value) {
 function applyTextTodoProgress(todos, messages, completionText) {
   var calls = [];
   (messages || []).forEach(function(msg) {
+    if (msg && msg.role === 'tool') {
+      calls.push({
+        done: true,
+        label: msg.name || msg.toolName || 'tool',
+        toolName: msg.name || msg.toolName || 'tool',
+        result: msg.content || '',
+      });
+    }
     ((msg && msg.toolCalls) || []).forEach(function(tool) { calls.push(tool); });
   });
   var doneLabels = calls.filter(function(tool) { return tool && tool.done; }).map(function(tool) {
@@ -4098,6 +4129,14 @@ function applyTextTodoProgress(todos, messages, completionText) {
     return String(tool.label || tool.toolName || tool.name || '').toLowerCase();
   }).join(' ');
   var finalText = String(completionText || '').toLowerCase();
+  var completedToolCount = calls.filter(function(tool) { return tool && tool.done; }).length;
+  var toolCompletedClaim = /\btool that ran\b|\bcompleted:\s*yes\b|\bexit code\s*0\b|\bcompleted without errors\b|\bcompleted successfully\b/.test(finalText);
+  var terminalCompleted = completedToolCount > 0 && (
+    /\bterminal\b|\bshell\b|\bprocess\b|\bcommand\b/.test(doneLabels + ' ' + doneDetails + ' ' + finalText)
+  ) && (toolCompletedClaim || /\bexit code\s*0\b/.test(doneDetails));
+  var waitCompleted = terminalCompleted && (
+    /\bsleep\s+\d+\b|\bwait\s+\d+\b|\bproc_[a-z0-9]+\b/.test(doneDetails + ' ' + finalText)
+  );
   var mermaidFound = /mermaid/.test(finalText) && /(implemented|rendering|hermes-ui\.html|createmermaidblock|rendermermaidblocks|initializemermaid|loadmermaidscript)/.test(finalText);
   if (!mermaidFound && /hermes-ui\.html|createmermaidblock|rendermermaidblocks|initializemermaid|loadmermaidscript/.test(doneDetails)) mermaidFound = true;
   var matchingFileInspected = mermaidFound && /(specific .*code|related code|lines? \d+|createmermaidblock|rendermermaidblocks|initializemermaid|loadmermaidscript|mermaid-block)/.test(finalText + ' ' + doneDetails);
@@ -4106,6 +4145,12 @@ function applyTextTodoProgress(todos, messages, completionText) {
     var text = String(todo.content || '').toLowerCase();
     var status = todo.status || 'pending';
     if (/(list|inspect).*(root|project)|root.*(list|inspect)/i.test(text) && (/\bls\b|find|rg|root|project/.test(doneLabels) || /project root files|serve_lite\.py|hermes-ui\.html/.test(finalText))) {
+      status = 'completed';
+    } else if (/(list|show|check).*(files|workspace)|files.*(workspace|current)/i.test(text) && (/\bls\b|find|rg|\"files\"\s*:|total_count|(?:^|\s)\*(?:\s|$)/.test(doneLabels + ' ' + doneDetails) || /workspace contains|current workspace|files (?:are|in)|serve_lite\.py|hermes-ui\.html/.test(finalText))) {
+      status = 'completed';
+    } else if (/(wait|sleep).*(second|seconds|terminal|process|tool)|terminal.*wait|process.*wait/i.test(text) && waitCompleted) {
+      status = 'completed';
+    } else if (/(report|tell|say).*(tool|command).*(ran|completed)|what tool ran|whether it completed|completed\??$/i.test(text) && toolCompletedClaim) {
       status = 'completed';
     } else if (/mermaid|render/i.test(text)) {
       if (mermaidFound) status = 'completed';
@@ -4295,9 +4340,62 @@ function shouldKeepTaskBoardItem(column, updated, active) {
   return active || ageMs <= TASK_NEEDS_YOU_RETENTION_MS;
 }
 
-function buildTaskBoardItems(conversations, streamingSessionIds, agentStateBySession, activeConvId) {
+function serverWorkItemsToTaskItems(serverWorkItems, conversationById, activeConvId) {
+  var source = Array.isArray(serverWorkItems) ? serverWorkItems : [];
+	  return source.filter(function(item) {
+	    var status = String((item && item.status) || 'running');
+	    var kind = String((item && item.kind) || 'Agent');
+	    // The server tracks every stream, but the UI only promotes task-worthy
+	    // work. Plain "Agent is writing" belongs in the small status area.
+	    return !(kind === 'Agent' && (status === 'running' || status === 'done') && !item.tool_count);
+	  }).filter(function(item) {
+	    var status = String((item && item.status) || 'running');
+	    var kind = String((item && item.kind) || 'Agent');
+	    var title = String((item && item.title) || '');
+	    return !(kind === 'Agent' && status === 'done' && title === 'Reply complete');
+	  }).map(function(item) {
+    var sessionId = item.session_id || item.sessionId || '';
+    var conv = sessionId && conversationById ? conversationById[sessionId] : null;
+    var status = String(item.status || 'running');
+    var column = item.column || (status === 'done' ? 'done' : status === 'error' || status === 'cancelled' ? 'blocked' : 'active');
+    return {
+      id: item.id || ('server:' + (item.stream_id || sessionId || Math.random())),
+      streamId: item.stream_id || '',
+      column: column,
+      title: taskPreview(item.title, 'Hermes work item'),
+      source: taskPreview((conv && (conv.title || conv.preview)) || sessionId || 'Server work', 'Server work'),
+      sessionId: sessionId,
+      kind: item.kind || 'Agent',
+      status: status === 'done' ? 'Done' : status === 'error' ? 'Error' : status === 'cancelled' ? 'Cancelled' : status === 'waiting' ? 'Waiting' : 'Running',
+      active: sessionId === activeConvId,
+      detail: taskPreview(item.detail || '', ''),
+      updated: item.updated_at || item.created_at || '',
+      serverBacked: true,
+    };
+  });
+}
+
+function applyTaskBoardControls(items, dismissedTaskItems, doneTaskItems) {
+  var dismissed = dismissedTaskItems || {};
+  var done = doneTaskItems || {};
+  return (items || []).filter(function(item) {
+    return !dismissed[item.id];
+  }).map(function(item) {
+    if (!done[item.id]) return item;
+    return Object.assign({}, item, {
+      column: 'done',
+      status: 'Done',
+      manuallyDone: true,
+    });
+  });
+}
+
+function buildTaskBoardItems(conversations, streamingSessionIds, agentStateBySession, activeConvId, serverWorkItems, dismissedTaskItems, doneTaskItems) {
   var items = [];
   var source = Array.isArray(conversations) ? conversations : [];
+  var conversationById = {};
+  source.forEach(function(conv) { if (conv && conv.id) conversationById[conv.id] = conv; });
+  items = items.concat(serverWorkItemsToTaskItems(serverWorkItems, conversationById, activeConvId));
   source.forEach(function(conv) {
     if (!conv || conv.archived) return;
     var messages = Array.isArray(conv.messages) ? conv.messages : [];
@@ -4403,7 +4501,7 @@ function buildTaskBoardItems(conversations, streamingSessionIds, agentStateBySes
       });
     });
   });
-  return items.filter(function(item) {
+  return applyTaskBoardControls(items, dismissedTaskItems, doneTaskItems).filter(function(item) {
     return shouldKeepTaskBoardItem(item.column, item.updated, item.active);
   }).sort(function(a, b) {
     if (!!a.active !== !!b.active) return a.active ? -1 : 1;
@@ -4411,11 +4509,11 @@ function buildTaskBoardItems(conversations, streamingSessionIds, agentStateBySes
   });
 }
 
-function TasksView({ conversations, streamingSessionIds, agentStateBySession, activeConvId, onOpenConversation }) {
+function TasksView({ conversations, streamingSessionIds, agentStateBySession, activeConvId, serverWorkItems, dismissedTaskItems, doneTaskItems, onOpenConversation, onDismissTask, onMarkTaskDone }) {
   var [filter, setFilter] = useState('');
   var items = useMemo(function() {
-    return buildTaskBoardItems(conversations, streamingSessionIds || [], agentStateBySession || {}, activeConvId);
-  }, [conversations, streamingSessionIds, agentStateBySession, activeConvId]);
+    return buildTaskBoardItems(conversations, streamingSessionIds || [], agentStateBySession || {}, activeConvId, serverWorkItems || [], dismissedTaskItems || {}, doneTaskItems || {});
+  }, [conversations, streamingSessionIds, agentStateBySession, activeConvId, serverWorkItems, dismissedTaskItems, doneTaskItems]);
   var query = filter.trim().toLowerCase();
   var visible = query ? items.filter(function(item) {
     return [item.title, item.source, item.kind, item.status].join(' ').toLowerCase().indexOf(query) !== -1;
@@ -4500,7 +4598,24 @@ function TasksView({ conversations, streamingSessionIds, agentStateBySession, ac
                         <div className="task-card-tags">
                           <span className="task-tag">{item.kind}</span>
                           <span className="task-tag">{item.status}</span>
+                          {item.serverBacked && <span className="task-tag">server</span>}
                           {item.active && <span className="task-tag">current</span>}
+                        </div>
+                        <div className="task-card-actions">
+                          {item.column !== 'done' && (
+                            <span
+                              className="task-card-action primary"
+                              onClick={function(e){ e.stopPropagation(); onMarkTaskDone && onMarkTaskDone(item); }}
+                            >
+                              Mark done
+                            </span>
+                          )}
+                          <span
+                            className="task-card-action"
+                            onClick={function(e){ e.stopPropagation(); onDismissTask && onDismissTask(item); }}
+                          >
+                            Dismiss
+                          </span>
                         </div>
                       </button>
                     );
@@ -4718,6 +4833,7 @@ function MessageBubble({ message, onImageClick, onEdit, onRetry, index, highligh
         <div className="toolless-work-warning">
           <Icon name="circle-alert" size={14}/>
           <span><strong>No tool ran.</strong> Hermes described local work, but this reply has no tool call attached. Treat it as not done until a tool result appears.</span>
+          {canRetry && <button onClick={() => onRetry(index)} title="Retry the previous prompt">Retry</button>}
         </div>
       )}
 
@@ -8703,9 +8819,9 @@ function App() {
   // If the session is still active, updates messages state (fast, visible immediately).
   // If the user switched to a different chat, writes to the conversations array instead
   // so the data is preserved and visible when they switch back.
-  const updateStreamMessages = (sessionId, updater) => {
-    var isActiveSession = activeConvRef.current === sessionId;
-    var nowIso = new Date().toISOString();
+	  const updateStreamMessages = (sessionId, updater) => {
+	    var isActiveSession = activeConvRef.current === sessionId;
+	    var nowIso = new Date().toISOString();
     if (activeConvRef.current === sessionId) {
       // Still viewing this conversation — update messages state normally
       setMessages(updater);
@@ -8726,11 +8842,30 @@ function App() {
           last_active_at: nowIso,
           unread_count: isActiveSession ? 0 : (c.unread_count || 1),
         };
-      })
-    );
-  };
+	      })
+	    );
+	  };
 
-  const [input, setInput] = useState('');
+	  const finalizeStreamMessages = (sessionId) => {
+	    if (!sessionId) return;
+	    updateStreamMessages(sessionId, function(prev) {
+	      var changed = false;
+	      var updated = (prev || []).map(function(m) {
+	        if (!m || m.role !== 'assistant' || (!m.streaming && !m.thinking)) return m;
+	        changed = true;
+	        return Object.assign({}, m, {
+	          streaming: false,
+	          thinking: false,
+	          toolCalls: (m.toolCalls || []).map(function(tc) {
+	            return Object.assign({}, tc, { done: true });
+	          }),
+	        });
+	      });
+	      return changed ? updated : (prev || []);
+	    });
+	  };
+
+	  const [input, setInput] = useState('');
 
   const applyWorkspaceList = function(items, lastPath) {
     var list = normalizeWorkspaceList(items, lastPath || activeWorkspacePath);
@@ -8956,6 +9091,13 @@ function App() {
       return saved ? JSON.parse(saved) : [];
     } catch(e) { return []; }
   });
+  const [serverWorkItems, setServerWorkItems] = useState([]);
+  const [dismissedTaskItems, setDismissedTaskItems] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('hermes-dismissed-task-items') || '{}') || {}; } catch(e) { return {}; }
+  });
+  const [doneTaskItems, setDoneTaskItems] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('hermes-done-task-items') || '{}') || {}; } catch(e) { return {}; }
+  });
   const [sessionTokens, setSessionTokens] = useState({ input: 0, output: 0 });
   const [editingMessageId, setEditingMessageId] = useState(null);
   const [editingContent, setEditingContent] = useState('');
@@ -9048,6 +9190,12 @@ function App() {
   useEffect(() => {
     localStorage.setItem('hermes-dismissed-todo-sessions', JSON.stringify(dismissedTodoSessions.slice(-80)));
   }, [dismissedTodoSessions]);
+  useEffect(() => {
+    try { localStorage.setItem('hermes-dismissed-task-items', JSON.stringify(dismissedTaskItems)); } catch(e) {}
+  }, [dismissedTaskItems]);
+  useEffect(() => {
+    try { localStorage.setItem('hermes-done-task-items', JSON.stringify(doneTaskItems)); } catch(e) {}
+  }, [doneTaskItems]);
 
   const resetTodosForConversation = function(conversationId, untilMessageId) {
     var convKey = conversationId || 'active-chat';
@@ -9057,6 +9205,46 @@ function App() {
       next.push(marker);
       return next.slice(-80);
     });
+  };
+
+  const refreshServerWorkItems = function() {
+    return fetch(API_BASE + '/api/work-items', { cache: 'no-store' })
+      .then(function(r) { return r.ok ? r.json() : { items: [] }; })
+      .then(function(d) { setServerWorkItems(Array.isArray(d.items) ? d.items : []); })
+      .catch(function() {});
+  };
+  useEffect(function() {
+    refreshServerWorkItems();
+    var iv = setInterval(refreshServerWorkItems, 5000);
+    return function() { clearInterval(iv); };
+  }, []);
+
+  const dismissTaskItem = function(item) {
+    if (!item || !item.id) return;
+    setDismissedTaskItems(function(prev) {
+      return Object.assign({}, prev, { [item.id]: Date.now() });
+    });
+    if (item.serverBacked && item.streamId) {
+      fetch(API_BASE + '/api/work-items', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'dismiss', stream_id: item.streamId }),
+      }).then(refreshServerWorkItems).catch(function() {});
+    }
+  };
+
+  const markTaskItemDone = function(item) {
+    if (!item || !item.id) return;
+    setDoneTaskItems(function(prev) {
+      return Object.assign({}, prev, { [item.id]: Date.now() });
+    });
+    if (item.serverBacked && item.streamId) {
+      fetch(API_BASE + '/api/work-items', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'done', stream_id: item.streamId, title: item.title, detail: item.detail }),
+      }).then(refreshServerWorkItems).catch(function() {});
+    }
   };
 
   useEffect(function() {
@@ -10758,10 +10946,11 @@ function App() {
           images: imageDrafts,
           files: fileDrafts,
         }));
-      }
+	      }
 
-      stopStreaming(sessionId);
-      clearAgentStateForSession(sessionId, 3600);
+	      finalizeStreamMessages(sessionId);
+	      stopStreaming(sessionId);
+	      clearAgentStateForSession(sessionId, 3600);
 
       // ── Handle backend session-id rotation from context compression ──
       // Mirrors the reference UI messages.js: S.session = d.session.
@@ -11288,7 +11477,10 @@ function App() {
     conversations.filter(function(c) { return c.id === activeConvId; }),
     streamingSessionIds || [],
     agentStateBySession || {},
-    activeConvId
+    activeConvId,
+    serverWorkItems,
+    dismissedTaskItems,
+    doneTaskItems
   ).filter(function(item) { return item.column === 'active' || item.column === 'blocked'; }).slice(0, 3) : [];
   var workStatusHasTaskAction = activeWorkItems.length > 0;
   var showWorkStatusPill = currentView === 'chat' && (isStreaming || activeWorkItems.length > 0 || !!activeAgentState);
@@ -12029,7 +12221,7 @@ function App() {
               </div>
             </div>
             {currentView === 'dashboard' && <DashboardView />}
-            {currentView === 'tasks' && <TasksView conversations={conversations} streamingSessionIds={streamingSessionIds} agentStateBySession={agentStateBySession} activeConvId={activeConvId} onOpenConversation={function(id){ if (id) selectConversation(id); setCurrentView('chat'); }} />}
+            {currentView === 'tasks' && <TasksView conversations={conversations} streamingSessionIds={streamingSessionIds} agentStateBySession={agentStateBySession} activeConvId={activeConvId} serverWorkItems={serverWorkItems} dismissedTaskItems={dismissedTaskItems} doneTaskItems={doneTaskItems} onDismissTask={dismissTaskItem} onMarkTaskDone={markTaskItemDone} onOpenConversation={function(id){ if (id) selectConversation(id); setCurrentView('chat'); }} />}
             {currentView === 'health' && <HealthView onOpenTerminal={function(){ setCurrentView('terminal'); }} onOpenMCP={function(){ setShowMCPBrowser(true); }} />}
             {currentView === 'files' && <FilesView activeWorkspace={activeWorkspace} />}
             {currentView === 'spaces' && <SpacesView workspaces={workspaces} activeWorkspace={activeWorkspace} onSwitch={switchWorkspace} onRefresh={refreshWorkspaces} />}
