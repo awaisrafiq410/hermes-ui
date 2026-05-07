@@ -1358,10 +1358,21 @@
     cursor: pointer; box-shadow: 0 10px 30px rgba(232,176,74,0.08);
     transition: border-color .16s ease, background .16s ease, transform .16s ease;
   }
+  .composer-work-banner.status-only {
+    cursor: default;
+    border-color: rgba(124,111,224,0.24);
+    background: linear-gradient(135deg, rgba(124,111,224,0.12), rgba(84,201,255,0.06));
+    box-shadow: none;
+  }
   .composer-work-banner:hover {
     transform: translateY(-1px);
     border-color: rgba(232,176,74,0.58);
     background: linear-gradient(135deg, rgba(232,176,74,0.20), rgba(124,111,224,0.11));
+  }
+  .composer-work-banner.status-only:hover {
+    transform: none;
+    border-color: rgba(124,111,224,0.24);
+    background: linear-gradient(135deg, rgba(124,111,224,0.12), rgba(84,201,255,0.06));
   }
   .composer-work-banner-main {
     min-width: 0; display: inline-flex; align-items: center; gap: 8px;
@@ -4262,9 +4273,26 @@ function toolTaskDetail(tool) {
   return text ? taskPreview(text, '') : '';
 }
 
-function contentSuggestsBackgroundFollowup(content) {
-  var text = String(content || '').toLowerCase();
-  return /(running in (the )?background|check back|i.ll check|i will check|wait for them to complete|background job|background process|(?:let me|i(?:'ll| will|’ll)|i need to)\s+(?:run|cut|crop|caption|render|upload|download|save|write|create|delete|move|copy|check|inspect|generate|transcribe)|(?:capturing|rendering|uploading|downloading|cutting|cropping|saving|writing|creating|moving|copying|checking|inspecting|generating|transcribing)\b.*\bnow\b)/.test(text);
+function contentSuggestsBackgroundFollowup(message) {
+  if (!message || message.role !== 'assistant') return false;
+  if (message.streaming || message.thinking || message.error) return false;
+  var text = String(message.content || '').toLowerCase();
+  if (!text) return false;
+  if ((message.toolCalls || []).some(function(tool) { return tool && !tool.done; })) return true;
+  if (/(running in (the )?background|background job|background process|wait for (it|them|that|the .*?) to complete|i.ll check back|i will check back|check back (in|when|after)|needs a final check)/.test(text)) return true;
+  return messageClaimsLocalWorkWithoutTools(message);
+}
+
+var TASK_DONE_RETENTION_MS = 6 * 60 * 60 * 1000;
+var TASK_NEEDS_YOU_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+function shouldKeepTaskBoardItem(column, updated, active) {
+  if (column === 'active') return true;
+  var ts = getConversationActivityTime({ last_active_at: updated });
+  var ageMs = ts ? Date.now() - ts : Infinity;
+  if (column === 'done') return active || ageMs <= TASK_DONE_RETENTION_MS;
+  if (column === 'blocked') return active || ageMs <= TASK_NEEDS_YOU_RETENTION_MS;
+  return active || ageMs <= TASK_NEEDS_YOU_RETENTION_MS;
 }
 
 function buildTaskBoardItems(conversations, streamingSessionIds, agentStateBySession, activeConvId) {
@@ -4277,28 +4305,38 @@ function buildTaskBoardItems(conversations, streamingSessionIds, agentStateBySes
     var isStreamingConv = streamingSessionIds.indexOf(conv.id) !== -1;
     var agentState = agentStateBySession && agentStateBySession[conv.id];
     var todos = getSessionTodos(messages);
+    var latestUserIndex = -1;
+    for (var userScanIndex = messages.length - 1; userScanIndex >= 0; userScanIndex--) {
+      if (messages[userScanIndex] && messages[userScanIndex].role === 'user') {
+        latestUserIndex = userScanIndex;
+        break;
+      }
+    }
     var latestAssistant = null;
     for (var latestIndex = messages.length - 1; latestIndex >= 0; latestIndex--) {
+      if (latestUserIndex !== -1 && latestIndex < latestUserIndex) break;
       if (messages[latestIndex] && messages[latestIndex].role === 'assistant') {
         latestAssistant = messages[latestIndex];
         break;
       }
     }
-    if (isStreamingConv || agentState) {
+    var agentKind = agentState && agentState.kind ? String(agentState.kind) : '';
+    var taskworthyAgentState = agentState && ['waiting', 'stuck', 'error', 'paused'].indexOf(agentKind) !== -1;
+    if (taskworthyAgentState) {
       items.push({
         id: conv.id + ':agent',
-        column: isStreamingConv ? 'active' : 'backlog',
+        column: agentKind === 'error' || agentKind === 'stuck' ? 'blocked' : 'active',
         title: taskPreview((agentState && (agentState.detail || agentState.label)) || convTitle, convTitle),
         source: convTitle,
         sessionId: conv.id,
         kind: 'Agent',
-        status: (agentState && agentState.label) || (isStreamingConv ? 'Running' : 'Ready'),
+        status: (agentState && agentState.label) || 'Needs attention',
         active: conv.id === activeConvId,
         detail: agentState && agentState.detail ? taskPreview(agentState.detail, '') : '',
         updated: conv.last_active_at || conv.created || '',
       });
     }
-    if (!isStreamingConv && latestAssistant && contentSuggestsBackgroundFollowup(latestAssistant.content)) {
+    if (!isStreamingConv && latestAssistant && contentSuggestsBackgroundFollowup(latestAssistant)) {
       var promisedToolWork = messageClaimsLocalWorkWithoutTools(latestAssistant);
       items.push({
         id: conv.id + ':background-followup',
@@ -4365,7 +4403,9 @@ function buildTaskBoardItems(conversations, streamingSessionIds, agentStateBySes
       });
     });
   });
-  return items.sort(function(a, b) {
+  return items.filter(function(item) {
+    return shouldKeepTaskBoardItem(item.column, item.updated, item.active);
+  }).sort(function(a, b) {
     if (!!a.active !== !!b.active) return a.active ? -1 : 1;
     return getConversationActivityTime({ last_active_at: b.updated }) - getConversationActivityTime({ last_active_at: a.updated });
   });
@@ -11250,6 +11290,7 @@ function App() {
     agentStateBySession || {},
     activeConvId
   ).filter(function(item) { return item.column === 'active' || item.column === 'blocked'; }).slice(0, 3) : [];
+  var workStatusHasTaskAction = activeWorkItems.length > 0;
   var showWorkStatusPill = currentView === 'chat' && (isStreaming || activeWorkItems.length > 0 || !!activeAgentState);
   var workStatusLabel = activeWorkItems.length
     ? (activeWorkItems[0].kind + ': ' + activeWorkItems[0].status)
@@ -11613,10 +11654,13 @@ function App() {
                   </div>
                 )}
                 {showWorkStatusPill && (
-                  <button
-                    className="composer-work-banner"
-                    onClick={function(){ setCurrentView('tasks'); }}
-                    title="Open Tasks to see what Hermes is doing"
+                  <div
+                    className={"composer-work-banner " + (workStatusHasTaskAction ? '' : 'status-only')}
+                    onClick={workStatusHasTaskAction ? function(){ setCurrentView('tasks'); } : undefined}
+                    title={workStatusHasTaskAction ? "Open Tasks to see what Hermes is doing" : "Hermes is writing this reply"}
+                    role={workStatusHasTaskAction ? "button" : "status"}
+                    tabIndex={workStatusHasTaskAction ? 0 : undefined}
+                    onKeyDown={workStatusHasTaskAction ? function(e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setCurrentView('tasks'); } } : undefined}
                   >
                     <span className="composer-work-banner-main">
                       <span className="status-dot-live"></span>
@@ -11624,8 +11668,8 @@ function App() {
                       <span>{workStatusLabel}</span>
                     </span>
                     <span className="composer-work-banner-detail">{workStatusDetail}</span>
-                    <span className="composer-work-banner-action">Open Tasks</span>
-                  </button>
+                    {workStatusHasTaskAction && <span className="composer-work-banner-action">Open Tasks</span>}
+                  </div>
                 )}
 
                 <div className="input-wrapper" style={{position:'relative'}} onDragEnter={handleDragEnter} onDragLeave={handleDragLeave} onDragOver={handleDragOver} onDrop={handleFileDrop}>
