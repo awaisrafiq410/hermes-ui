@@ -4180,8 +4180,16 @@ function messageClaimsLocalWorkWithoutTools(message) {
   var text = String(message.content || '').replace(/\s+/g, ' ').trim().toLowerCase();
   if (!text) return false;
   var localNoun = /(file|folder|directory|path|video|image|audio|caption|thumbnail|script|command|terminal|process|upload|download|ffmpeg|python|crop|cut|render|transcrib|generate|saved?|created?|deleted?|moved?|copied?)/;
-  var workClaim = /\b(i(?:'m| am|’m)?\s+(?:still\s+)?(?:cutting|cropping|rendering|uploading|downloading|saving|writing|creating|deleting|moving|copying|running|executing|checking|inspecting|generating|transcribing)|(?:cutting|cropping|rendering|uploading|downloading|saving|writing|creating|deleting|moving|copying|running|executing|checking|inspecting|generating|transcribing)\s+now|still\s+(?:cutting|cropping|rendering|uploading|downloading|running|generating|transcribing)|let\s+me\s+(?:run|cut|crop|render|upload|download|save|write|create|delete|move|copy|check|inspect|generate|transcribe)|i(?:'ll| will|’ll)\s+(?:run|cut|crop|render|upload|download|save|write|create|delete|move|copy|check|inspect|generate|transcribe)|(?:has been|is|are)\s+(?:cut|cropped|rendered|uploaded|downloaded|saved|written|created|deleted|moved|copied|checked|inspected|generated|transcribed))\b/;
+  var workClaim = /\b(i(?:'m| am|’m)?\s+(?:still\s+)?(?:cutting|cropping|rendering|uploading|downloading|saving|writing|creating|deleting|moving|copying|running|executing|checking|inspecting|generating|transcribing|polling|waiting)|(?:cutting|cropping|rendering|uploading|downloading|saving|writing|creating|deleting|moving|copying|running|executing|checking|inspecting|generating|transcribing|polling|waiting)\s+now|still\s+(?:cutting|cropping|rendering|uploading|downloading|running|generating|transcribing|polling|waiting)|let\s+me\s+(?:run|cut|crop|render|upload|download|save|write|create|delete|move|copy|check|inspect|generate|transcribe|poll|wait)|i(?:'ll| will|’ll)\s+(?:run|cut|crop|render|upload|download|save|write|create|delete|move|copy|check|inspect|generate|transcribe|poll|wait)|(?:has been|is|are)\s+(?:cut|cropped|rendered|uploaded|downloaded|saved|written|created|deleted|moved|copied|checked|inspected|generated|transcribed|queued|processing)|polling\s+for\s+completion|waiting\s+for\s+(?:completion|it|them)|queued\.\s*(?:polling|waiting))\b/;
   return localNoun.test(text) && workClaim.test(text);
+}
+
+function messageNeedsFollowupAfterStopping(message) {
+  if (!message || message.role !== 'assistant') return false;
+  if (message.streaming || message.thinking || message.error) return false;
+  var text = String(message.content || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  if (!text) return false;
+  return /\b(polling for completion|waiting for completion|queued\.\s*(?:polling|waiting)|i(?:'ll| will|’ll)\s+(?:check|poll|wait)|i(?:'m| am|’m)?\s+(?:still\s+)?(?:polling|waiting)|check back (?:later|when|after)|i(?:'ll| will|’ll) check back)\b/.test(text);
 }
 
 function getSessionTodos(messages) {
@@ -4325,6 +4333,7 @@ function contentSuggestsBackgroundFollowup(message) {
   if (!text) return false;
   if ((message.toolCalls || []).some(function(tool) { return tool && !tool.done; })) return true;
   if (/(running in (the )?background|background job|background process|wait for (it|them|that|the .*?) to complete|i.ll check back|i will check back|check back (in|when|after)|needs a final check)/.test(text)) return true;
+  if (messageNeedsFollowupAfterStopping(message)) return true;
   return messageClaimsLocalWorkWithoutTools(message);
 }
 
@@ -4342,18 +4351,18 @@ function shouldKeepTaskBoardItem(column, updated, active) {
 
 function serverWorkItemsToTaskItems(serverWorkItems, conversationById, activeConvId) {
   var source = Array.isArray(serverWorkItems) ? serverWorkItems : [];
-	  return source.filter(function(item) {
-	    var status = String((item && item.status) || 'running');
-	    var kind = String((item && item.kind) || 'Agent');
-	    // The server tracks every stream, but the UI only promotes task-worthy
-	    // work. Plain "Agent is writing" belongs in the small status area.
-	    return !(kind === 'Agent' && (status === 'running' || status === 'done') && !item.tool_count);
-	  }).filter(function(item) {
-	    var status = String((item && item.status) || 'running');
-	    var kind = String((item && item.kind) || 'Agent');
-	    var title = String((item && item.title) || '');
-	    return !(kind === 'Agent' && status === 'done' && title === 'Reply complete');
-	  }).map(function(item) {
+  return source.filter(function(item) {
+    var status = String((item && item.status) || 'running');
+    var kind = String((item && item.kind) || 'Agent');
+    // The server tracks every stream, but the UI only promotes task-worthy
+    // work. Plain "Agent is writing" belongs in the small status area.
+    return !(kind === 'Agent' && (status === 'running' || status === 'done') && !item.tool_count);
+  }).filter(function(item) {
+    var status = String((item && item.status) || 'running');
+    var kind = String((item && item.kind) || 'Agent');
+    var title = String((item && item.title) || '');
+    return !(kind === 'Agent' && status === 'done' && title === 'Reply complete');
+  }).map(function(item) {
     var sessionId = item.session_id || item.sessionId || '';
     var conv = sessionId && conversationById ? conversationById[sessionId] : null;
     var status = String(item.status || 'running');
@@ -4370,9 +4379,20 @@ function serverWorkItemsToTaskItems(serverWorkItems, conversationById, activeCon
       active: sessionId === activeConvId,
       detail: taskPreview(item.detail || '', ''),
       updated: item.updated_at || item.created_at || '',
+      created: item.created_at || item.updated_at || '',
       serverBacked: true,
     };
   });
+}
+
+function isComposerWorkBannerItem(item) {
+  if (!item) return false;
+  var column = String(item.column || '');
+  var kind = String(item.kind || '');
+  if (column === 'blocked') return true;
+  if (kind === 'Tool needed' || kind === 'Background') return true;
+  if (kind === 'Todo' || /subagents/i.test(kind)) return true;
+  return false;
 }
 
 function applyTaskBoardControls(items, dismissedTaskItems, doneTaskItems) {
@@ -4436,13 +4456,14 @@ function buildTaskBoardItems(conversations, streamingSessionIds, agentStateBySes
     }
     if (!isStreamingConv && latestAssistant && contentSuggestsBackgroundFollowup(latestAssistant)) {
       var promisedToolWork = messageClaimsLocalWorkWithoutTools(latestAssistant);
+      var stoppedBeforeFollowup = messageNeedsFollowupAfterStopping(latestAssistant);
       items.push({
         id: conv.id + ':background-followup',
         column: 'blocked',
-        title: promisedToolWork ? 'Promised work needs a real tool' : 'Background work needs a final check',
+        title: stoppedBeforeFollowup ? 'Stopped before follow-up' : (promisedToolWork ? 'Promised work needs a real tool' : 'Background work needs a final check'),
         source: convTitle,
         sessionId: conv.id,
-        kind: promisedToolWork ? 'Tool needed' : 'Background',
+        kind: stoppedBeforeFollowup ? 'Follow-up' : (promisedToolWork ? 'Tool needed' : 'Background'),
         status: 'Needs follow-up',
         active: conv.id === activeConvId,
         detail: taskPreview(latestAssistant.content, ''),
@@ -4734,7 +4755,8 @@ function MessageBubble({ message, onImageClick, onEdit, onRetry, index, highligh
   var reasoningText = reasoningItems.map(function(item) {
     return typeof item === 'string' ? item : (item && item.text) || '';
   }).filter(Boolean).join('\n');
-  var showToollessWorkWarning = messageClaimsLocalWorkWithoutTools(message);
+  var stoppedBeforeFollowup = messageNeedsFollowupAfterStopping(message);
+  var showToollessWorkWarning = messageClaimsLocalWorkWithoutTools(message) || stoppedBeforeFollowup;
 
   useEffect(() => {
     if (!contentRef.current) return;
@@ -4832,7 +4854,11 @@ function MessageBubble({ message, onImageClick, onEdit, onRetry, index, highligh
       {showToollessWorkWarning && (
         <div className="toolless-work-warning">
           <Icon name="circle-alert" size={14}/>
-          <span><strong>No tool ran.</strong> Hermes described local work, but this reply has no tool call attached. Treat it as not done until a tool result appears.</span>
+          {stoppedBeforeFollowup ? (
+            <span><strong>Follow-up stopped.</strong> Hermes said it was polling/checking, but this turn ended. Retry or ask it to continue from here.</span>
+          ) : (
+            <span><strong>No tool ran.</strong> Hermes described local work, but this reply has no tool call attached. Treat it as not done until a tool result appears.</span>
+          )}
           {canRetry && <button onClick={() => onRetry(index)} title="Retry the previous prompt">Retry</button>}
         </div>
       )}
@@ -11482,15 +11508,16 @@ function App() {
     dismissedTaskItems,
     doneTaskItems
   ).filter(function(item) { return item.column === 'active' || item.column === 'blocked'; }).slice(0, 3) : [];
-  var workStatusHasTaskAction = activeWorkItems.length > 0;
-  var showWorkStatusPill = currentView === 'chat' && (isStreaming || activeWorkItems.length > 0 || !!activeAgentState);
-  var workStatusLabel = activeWorkItems.length
-    ? (activeWorkItems[0].kind + ': ' + activeWorkItems[0].status)
+  var composerWorkItems = activeWorkItems.filter(isComposerWorkBannerItem).slice(0, 3);
+  var workStatusHasTaskAction = composerWorkItems.length > 0;
+  var showWorkStatusPill = currentView === 'chat' && workStatusHasTaskAction;
+  var workStatusLabel = composerWorkItems.length
+    ? (composerWorkItems[0].kind + ': ' + composerWorkItems[0].status)
     : (visibleAgentState && visibleAgentState.label)
       ? visibleAgentState.label
       : (isStreaming ? 'Working' : 'Tasks');
-  var workStatusDetail = activeWorkItems.length
-    ? activeWorkItems[0].title
+  var workStatusDetail = composerWorkItems.length
+    ? composerWorkItems[0].title
     : (visibleAgentState && visibleAgentState.detail)
       ? visibleAgentState.detail
       : 'Open Tasks for live progress';

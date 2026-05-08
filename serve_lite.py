@@ -703,6 +703,9 @@ def _get_session_lock(session_id):
 # _restore_reasoning_metadata. Keeps tool_calls/tool_call_id intact so weak
 # tool-callers (MiniMax) keep seeing real tool-use precedent in history.
 _API_SAFE_MSG_KEYS = {"role", "content", "tool_calls", "tool_call_id", "name", "refusal"}
+_FALLBACK_CONTEXT_MESSAGE_LIMIT = 80
+_MODEL_CONTEXT_MESSAGE_LIMIT = 60
+_MODEL_CONTEXT_CHAR_LIMIT = 35000
 
 
 def _sanitize_messages_for_api(messages):
@@ -740,6 +743,190 @@ def _sanitize_messages_for_api(messages):
         if sanitized.get("role"):
             clean.append(sanitized)
     return clean
+
+
+def _context_messages_for_session(session):
+    """Return model-facing history, keeping long UI transcripts out of prompts."""
+    if isinstance(session, dict):
+        context_messages = session.get("context_messages")
+        if isinstance(context_messages, list) and context_messages:
+            return context_messages
+        return session.get("messages") or []
+    return []
+
+
+def _limited_fallback_history(messages):
+    """Last-resort browser-history repair, capped to avoid huge prompt bloat."""
+    clean = _sanitize_messages_for_api(messages)
+    if len(clean) <= _FALLBACK_CONTEXT_MESSAGE_LIMIT:
+        return clean
+    return _sanitize_messages_for_api(clean[-_FALLBACK_CONTEXT_MESSAGE_LIMIT:])
+
+
+def _message_context_size(msg):
+    if not isinstance(msg, dict):
+        return 0
+    try:
+        return len(json.dumps(msg.get("content", ""), ensure_ascii=False))
+    except Exception:
+        return len(str(msg.get("content", "")))
+
+
+def _message_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text") or item.get("content") or ""))
+            else:
+                parts.append(str(item))
+        return "\n".join(part for part in parts if part)
+    return str(content or "")
+
+
+def _message_identity(msg):
+    if not isinstance(msg, dict):
+        return None
+    role = str(msg.get("role") or "")
+    text = _message_text(msg.get("content", ""))
+    if not text and not msg.get("tool_call_id") and not msg.get("tool_calls"):
+        return None
+    return (
+        role,
+        " ".join(str(text or "").split())[:500],
+        str(msg.get("tool_call_id") or ""),
+        json.dumps(msg.get("tool_calls") or [], sort_keys=True, ensure_ascii=False),
+    )
+
+
+def _messages_have_prefix(messages, prefix):
+    if len(messages or []) < len(prefix or []):
+        return False
+    for idx, expected in enumerate(prefix or []):
+        if _message_identity((messages or [])[idx]) != _message_identity(expected):
+            return False
+    return True
+
+
+def _is_context_compression_marker(msg):
+    if not isinstance(msg, dict):
+        return False
+    text = _message_text(msg.get("content", "")).lower()
+    return (
+        "context compaction" in text
+        or "context compression" in text
+        or "context was auto-compressed" in text
+        or "active task list was preserved across context compression" in text
+    )
+
+
+def _find_current_user_turn(messages, msg_text):
+    needle = " ".join(str(msg_text or "").split())
+    fallback = None
+    for idx, msg in enumerate(messages or []):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        fallback = idx
+        text = " ".join(_message_text(msg.get("content", "")).split())
+        if needle and (needle in text or text in needle):
+            return idx
+    return fallback
+
+
+def _merge_display_messages_after_agent_result(previous_display, previous_context, result_messages, msg_text):
+    """Keep the full visible chat while model-facing context stays compact."""
+    previous_display = list(previous_display or [])
+    previous_context = list(previous_context or [])
+    result_messages = list(result_messages or [])
+    if not result_messages:
+        return previous_display
+
+    if _messages_have_prefix(result_messages, previous_context):
+        candidates = result_messages[len(previous_context):]
+    else:
+        current_user_idx = _find_current_user_turn(result_messages, msg_text)
+        marker_candidates = [
+            m for m in result_messages[:current_user_idx if current_user_idx is not None else len(result_messages)]
+            if _is_context_compression_marker(m)
+        ]
+        turn_candidates = result_messages[current_user_idx:] if current_user_idx is not None else []
+        candidates = marker_candidates + turn_candidates
+
+    merged = list(previous_display)
+    seen = {_message_identity(m) for m in merged}
+    for msg in candidates:
+        ident = _message_identity(msg)
+        if ident is None:
+            continue
+        if ident in seen:
+            continue
+        if _is_context_compression_marker(msg) and ident in seen:
+            continue
+        merged.append(msg)
+        seen.add(ident)
+    return merged
+
+
+def _trim_model_history(messages):
+    """Bound model-facing history while preserving the visible transcript separately."""
+    clean = _sanitize_messages_for_api(messages)
+    if not clean:
+        return []
+    kept = []
+    total_chars = 0
+    for msg in reversed(clean):
+        size = _message_context_size(msg)
+        if kept and (len(kept) >= _MODEL_CONTEXT_MESSAGE_LIMIT or total_chars + size > _MODEL_CONTEXT_CHAR_LIMIT):
+            break
+        kept.append(msg)
+        total_chars += size
+    return _sanitize_messages_for_api(list(reversed(kept)))
+
+
+def _assistant_claims_local_work_without_tools(msg):
+    """Detect promise-only local work replies that should not steer context."""
+    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+        return False
+    if msg.get("tool_calls"):
+        return False
+    text = " ".join(str(msg.get("content") or "").lower().split())
+    if not text:
+        return False
+    local_noun = re.search(
+        r"(file|folder|directory|path|video|image|audio|caption|thumbnail|"
+        r"script|command|terminal|process|upload|download|ffmpeg|python|"
+        r"crop|cut|render|transcrib|generate|saved?|created?|deleted?|moved?|copied?)",
+        text,
+    )
+    work_claim = re.search(
+        r"\b(i(?:'m| am|’m)?\s+(?:still\s+)?(?:cutting|cropping|rendering|"
+        r"uploading|downloading|saving|writing|creating|deleting|moving|"
+        r"copying|running|executing|checking|inspecting|generating|"
+        r"transcribing|polling|waiting)|(?:cutting|cropping|rendering|"
+        r"uploading|downloading|saving|writing|creating|deleting|moving|"
+        r"copying|running|executing|checking|inspecting|generating|"
+        r"transcribing|polling|waiting)\s+now|still\s+(?:cutting|cropping|"
+        r"rendering|uploading|downloading|running|generating|transcribing|"
+        r"polling|waiting)|let\s+me\s+(?:run|cut|crop|render|upload|"
+        r"download|save|write|create|delete|move|copy|check|inspect|"
+        r"generate|transcribe|poll|wait)|i(?:'ll| will|’ll)\s+(?:run|"
+        r"cut|crop|render|upload|download|save|write|create|delete|move|"
+        r"copy|check|inspect|generate|transcribe|poll|wait)|polling\s+for\s+"
+        r"completion|waiting\s+for\s+(?:completion|it|them)|queued\.\s*"
+        r"(?:polling|waiting))\b",
+        text,
+    )
+    return bool(local_noun and work_claim)
+
+
+def _remove_promise_only_tail(messages):
+    """Do not let fake local-progress narration become next-turn context."""
+    cleaned = list(messages or [])
+    while cleaned and _assistant_claims_local_work_without_tools(cleaned[-1]):
+        cleaned.pop()
+    return cleaned
 
 
 def _restore_reasoning_metadata(previous_messages, updated_messages):
@@ -1405,28 +1592,17 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
             "prefer ripgrep-style targeted searches. Do not recursively search "
             "the user's home directory or parent directories unless the user "
             "explicitly asks for that broader scope.\n"
-            "Tool honesty rule: never claim that you created, edited, cut, "
-            "cropped, uploaded, downloaded, moved, deleted, ran, checked, "
-            "inspected, generated, transcribed, or otherwise changed a local "
-            "file or process unless you actually used a tool in this turn and "
-            "observed the result. If you need to do local/process work, use the "
-            "appropriate file, terminal, process, browser, or MCP tool first. If "
-            "no tool was used, say you have not done it yet and describe the "
-            "tool action needed. If you start background jobs, poll or inspect "
-            "them before ending the turn and report the final result instead of "
-            "saying you will check back later. After a tool result, if your next "
-            "sentence says you need to run, caption, render, upload, check, or "
-            "otherwise perform another local action, call the needed tool in the "
-            "same turn instead of ending with a promise to do it."
+            "Do not claim local file/process work is complete unless you actually "
+            "used a tool in this turn and observed the result."
         )
 
-        # Prefer the server-side session because it preserves tool_calls/tool
-        # results. However, context compression/session-id rotation can leave
-        # the server file shorter than the UI transcript. In that drift case,
-        # use the frontend transcript for this turn so Hermes does not "forget"
-        # most of the visible conversation.
+        # Prefer the model-facing context when available. The UI transcript can
+        # grow very large, so browser-history repair is capped and only used as
+        # a last resort, matching Reference's display-vs-context split.
         session = _get_or_create_session(session_id)
         _previous_messages = list(session.get("messages") or [])
+        _previous_context_messages = list(_context_messages_for_session(session))
+        _has_context_messages = isinstance(session.get("context_messages"), list) and bool(session.get("context_messages"))
         _server_user_count = sum(1 for _m in _previous_messages if _m.get("role") == "user")
         _client_user_count = sum(1 for _m in messages if isinstance(_m, dict) and _m.get("role") == "user")
         _use_client_history = _client_user_count > (_server_user_count + 3)
@@ -1437,11 +1613,20 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
                 "repairing server transcript from frontend",
                 flush=True,
             )
-            clean_history = _sanitize_messages_for_api(messages)
-            _previous_messages = list(clean_history)
+            _previous_messages = _sanitize_messages_for_api(messages)
+            if _has_context_messages:
+                clean_history = _trim_model_history(_previous_context_messages)
+            else:
+                clean_history = _limited_fallback_history(messages)
         else:
-            clean_history = _sanitize_messages_for_api(_previous_messages)
+            clean_history = (
+                _trim_model_history(_previous_context_messages)
+                if _has_context_messages
+                else _limited_fallback_history(_previous_messages)
+            )
         # Remove the last user message — it goes in user_message param instead
+        clean_history = _remove_promise_only_tail(clean_history)
+        clean_history = _trim_model_history(clean_history)
         if clean_history and clean_history[-1].get("role") == "user":
             clean_history.pop()
 
@@ -1516,9 +1701,16 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
         # overwriting here would replace them with the agent's
         # partial/empty run_conversation result (reference #893 companion fix).
         if not cancel_event.is_set():
-            _merged = _restore_reasoning_metadata(
+            _result_messages = result.get("messages") or session.get("messages") or []
+            session["context_messages"] = _restore_reasoning_metadata(
+                _previous_context_messages,
+                _trim_model_history(_remove_promise_only_tail(_result_messages)),
+            )
+            _merged = _merge_display_messages_after_agent_result(
                 _previous_messages,
-                result.get("messages") or session.get("messages") or [],
+                _previous_context_messages,
+                _restore_reasoning_metadata(_previous_messages, _result_messages),
+                user_msg,
             )
             # Collapse any multimodal user content back to plain text before
             # persisting. The agent saw the image in-turn; we don't want to
