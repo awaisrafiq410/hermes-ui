@@ -1592,6 +1592,11 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
             "prefer ripgrep-style targeted searches. Do not recursively search "
             "the user's home directory or parent directories unless the user "
             "explicitly asks for that broader scope.\n"
+            "Every user message is also prefixed with [Visible transcript: ...]. "
+            "That line describes the full visible Web UI transcript, even when "
+            "the model-facing context has been compacted. If the user asks how "
+            "many prompts/messages are in this chat, use the Visible transcript "
+            "counts instead of counting only the compact context you can see.\n"
             "Do not claim local file/process work is complete unless you actually "
             "used a tool in this turn and observed the result."
         )
@@ -1605,7 +1610,7 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
         _has_context_messages = isinstance(session.get("context_messages"), list) and bool(session.get("context_messages"))
         _server_user_count = sum(1 for _m in _previous_messages if _m.get("role") == "user")
         _client_user_count = sum(1 for _m in messages if isinstance(_m, dict) and _m.get("role") == "user")
-        _use_client_history = _client_user_count > (_server_user_count + 3)
+        _use_client_history = _client_user_count > _server_user_count
         if _use_client_history:
             print(
                 f"[serve] /api/chat/start history drift for {session_id}: "
@@ -1639,6 +1644,16 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
         if user_msg and not (_pending_msgs and _pending_msgs[-1].get("role") == "user"
                              and _pending_msgs[-1].get("content") == user_msg):
             _pending_msgs.append({"role": "user", "content": user_msg})
+        _visible_user_prompts = sum(1 for _m in _pending_msgs if isinstance(_m, dict) and _m.get("role") == "user")
+        _visible_assistant_replies = sum(1 for _m in _pending_msgs if isinstance(_m, dict) and _m.get("role") == "assistant")
+        _visible_tool_results = sum(1 for _m in _pending_msgs if isinstance(_m, dict) and _m.get("role") == "tool")
+        transcript_ctx = (
+            f"[Visible transcript: {_visible_user_prompts} user prompts, "
+            f"{len(_pending_msgs)} total messages, "
+            f"{_visible_assistant_replies} assistant replies, "
+            f"{_visible_tool_results} tool results]\n"
+        )
+        turn_ctx = workspace_ctx + transcript_ctx
         session["messages"] = _pending_msgs
         session["model"] = model
         _save_session(session_id, session)
@@ -1673,7 +1688,7 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
         # Gemini-describe fallback and strips .images before POSTing.
         if user_images:
             _agent_user_msg = [
-                {"type": "text", "text": workspace_ctx + user_msg},
+                {"type": "text", "text": turn_ctx + user_msg},
                 *user_images,
             ]
             print(
@@ -1682,7 +1697,7 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
                 flush=True,
             )
         else:
-            _agent_user_msg = workspace_ctx + user_msg
+            _agent_user_msg = turn_ctx + user_msg
 
         result = agent.run_conversation(
             user_message=_agent_user_msg,
