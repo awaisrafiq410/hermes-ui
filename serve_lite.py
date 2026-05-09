@@ -272,7 +272,7 @@ def _set_last_workspace(path):
 # Current hermes-ui release version. Bump on every tagged release so the
 # /api/version endpoint can tell the UI when a newer release is available on
 # GitHub. Keep in sync with the git tag (e.g. "3.3" corresponds to v3.3).
-__version__ = "3.3.9"
+__version__ = "3.3.10"
 _GITHUB_RELEASES_API = "https://api.github.com/repos/pyrate-llama/hermes-ui/releases/latest"
 _HERMES_AGENT_RELEASES_API = "https://api.github.com/repos/NousResearch/hermes-agent/releases/latest"
 
@@ -1067,6 +1067,20 @@ def _trim_model_history(messages):
     return _sanitize_messages_for_api(list(reversed(kept)))
 
 
+def _provider_history_from_transcript(messages, current_user_msg=""):
+    """Return provider-safe history without silently compacting the transcript.
+
+    the reference UI passes the saved session context through API sanitization and
+    lets Hermes Agent's own compressor decide when real context compression is
+    needed. Keep the same contract here: drop UI-only/error/noise fields, but do
+    not locally narrow the conversation to a small tail window without emitting
+    a compression event.
+    """
+    history = _remove_promise_only_tail(_remove_contradicted_tool_denials(messages or []))
+    history = _drop_checkpointed_current_user_from_context(history, current_user_msg)
+    return _sanitize_messages_for_api(history)
+
+
 def _messages_have_tool_evidence(messages):
     return any(
         isinstance(msg, dict)
@@ -1657,9 +1671,7 @@ def _session_health_snapshot(session_id, client_messages=None, repair_from_clien
             if repair_from_client:
                 repaired_messages = _merge_browser_repair_messages(server_messages, client_clean)
                 session["messages"] = repaired_messages
-                session["context_messages"] = _trim_model_history(
-                    _remove_contradicted_tool_denials(repaired_messages)
-                )
+                session["context_messages"] = _provider_history_from_transcript(repaired_messages)
                 session["recovered_at"] = _utc_now_iso()
                 _save_session(session_id, session)
                 server_messages = list(repaired_messages)
@@ -1673,9 +1685,7 @@ def _session_health_snapshot(session_id, client_messages=None, repair_from_clien
             if repair_from_client:
                 repaired_messages = _merge_browser_repair_messages(server_messages, client_messages)
                 session["messages"] = repaired_messages
-                session["context_messages"] = _trim_model_history(
-                    _remove_contradicted_tool_denials(repaired_messages)
-                )
+                session["context_messages"] = _provider_history_from_transcript(repaired_messages)
                 session["recovered_at"] = _utc_now_iso()
                 _save_session(session_id, session)
                 server_messages = list(repaired_messages)
@@ -2068,18 +2078,16 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
             "claiming final status."
         )
 
-        # the reference UI keeps backend session messages authoritative and only
-        # switches to compact context after real compression. Our single-file UI
-        # keeps a separate compact context too, but for ordinary-sized chats we
-        # rebuild from the full backend transcript so side quests do not erase
-        # the project thread without a visible compaction event.
+        # the reference UI keeps backend session context authoritative and lets
+        # Hermes Agent perform real compression. Do not locally narrow the
+        # conversation to a small tail window; that creates invisible fake
+        # compaction where Hermes can count old prompts but cannot recall them.
         session = _get_or_create_session(session_id)
         _previous_messages = list(session.get("messages") or [])
-        _previous_context_messages = _drop_checkpointed_current_user_from_context(
-            _remove_contradicted_tool_denials(_context_messages_for_session(session)),
+        _previous_context_messages = _provider_history_from_transcript(
+            _context_messages_for_session(session),
             user_msg,
         )
-        _has_context_messages = isinstance(session.get("context_messages"), list) and bool(session.get("context_messages"))
         _server_user_count = sum(1 for _m in _previous_messages if _m.get("role") == "user")
         _client_user_count = sum(1 for _m in messages if isinstance(_m, dict) and _m.get("role") == "user")
         _use_client_history = _client_user_count > _server_user_count
@@ -2091,30 +2099,10 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
                 flush=True,
             )
             _previous_messages = _merge_browser_repair_messages(_previous_messages, messages)
-            _previous_context_messages = _full_transcript_context(_previous_messages, user_msg)
-            clean_history = list(_previous_context_messages)
-        elif _should_use_full_transcript_context(_previous_messages):
-            clean_history = _full_transcript_context(_previous_messages, user_msg)
-            _previous_context_messages = list(clean_history)
-            if _has_context_messages:
-                _ctx_users = _count_role_messages(_context_messages_for_session(session), "user")
-                _full_users = _count_role_messages(clean_history, "user")
-                if _full_users > _ctx_users:
-                    print(
-                        f"[serve] /api/chat/start using full transcript context for {session_id}: "
-                        f"users={_full_users} compact_users={_ctx_users}",
-                        flush=True,
-                    )
-        else:
-            clean_history = (
-                _trim_model_history(_previous_context_messages)
-                if _has_context_messages
-                else _limited_fallback_history(_previous_messages)
-            )
+            _previous_context_messages = _provider_history_from_transcript(_previous_messages, user_msg)
+        clean_history = list(_previous_context_messages)
         # Remove the last user message — it goes in user_message param instead
         clean_history = _remove_promise_only_tail(clean_history)
-        if not _should_use_full_transcript_context(clean_history):
-            clean_history = _trim_model_history(clean_history)
         if clean_history and clean_history[-1].get("role") == "user":
             clean_history.pop()
 
@@ -2208,11 +2196,7 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
             )
             session["context_messages"] = _restore_reasoning_metadata(
                 _previous_context_messages,
-                (
-                    _full_transcript_context(_merged, "")
-                    if _should_use_full_transcript_context(_merged)
-                    else _trim_model_history(_remove_contradicted_tool_denials(_remove_promise_only_tail(_result_messages)))
-                ),
+                _provider_history_from_transcript(_result_messages),
             )
             # Collapse any multimodal user content back to plain text before
             # persisting. The agent saw the image in-turn; we don't want to
