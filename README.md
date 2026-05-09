@@ -6,7 +6,7 @@ The command center for [Hermes Agent](https://github.com/pyrate-llama/hermes-age
 
 Built as a single-file HTML application with React 18, Hermes UI provides a full-featured chat interface, real-time log streaming, file browsing, memory inspection, and more — all through a lightweight Python proxy server.
 
-![v3.3.2](https://img.shields.io/badge/version-3.3.2-ef4444?style=for-the-badge)
+![v3.3.7](https://img.shields.io/badge/version-3.3.7-ef4444?style=for-the-badge)
 ![Single file HTML](https://img.shields.io/badge/architecture-single_file-44d88a?style=for-the-badge)
 ![React 18](https://img.shields.io/badge/react-18.2-61dafb?style=for-the-badge)
 
@@ -36,6 +36,53 @@ Built as a single-file HTML application with React 18, Hermes UI provides a full
 ![Built-in terminal area with Hermes and Claude Code tabs](screenshots/terminal.png)
 
 ---
+
+## What's new in v3.3.7
+
+Hermes UI 3.3.7 makes recovered UI tool receipts visible to model context without pretending they are provider-native tool calls.
+
+**Recovered tool receipt context**
+- **Provenance-labeled receipts** — recovered UI `toolCalls` are shown as UI-observed tool events, not forged provider-native `tool_calls`
+- **Bad correction pruning** — model context drops broken self-corrections like "I didn't run any tools" when earlier UI-observed tool receipts exist
+- **Verification guard** — if UI receipts lack captured results, Hermes must verify the artifact/status with tools before claiming final state
+
+## What's new in v3.3.6
+
+Hermes UI 3.3.6 fixes the browser/server repair path that could drop recent UI tool receipts after a transcript drift repair.
+
+**Tool receipt recovery**
+- **UI tool receipts restored** — `/api/session/health` can now recover browser-persisted `toolCalls` from `~/.hermes/ui-conversations.json` when the server session is missing them
+- **Equal-count repair** — repair now runs when the browser has tool evidence missing from the server, even if both sides have the same number of user prompts
+- **Reference-aligned authority split** — browser text can repair missing visible transcript text, but it no longer replaces richer backend tool history
+
+## What's new in v3.3.5
+
+Hermes UI 3.3.5 fixes a follow-up memory bug where Hermes could see a prior "work completed" transcript but reject it because tool evidence was missing from the repaired context.
+
+**Transcript/tool evidence repair**
+- **No instant self-contradiction** — if prior transcript says work finished but tool metadata is missing, Hermes now treats it as unverified prior state and verifies with tools instead of forgetting the topic or denying the previous turn
+- **Tool-safe browser repair** — browser-ahead transcript repair now preserves existing server-side `tool_calls` and `tool` messages instead of replacing them with a simplified browser transcript
+- **API history preservation** — the frontend now sends API-safe tool messages and tool-call fields back to the server so future repairs keep real work evidence intact
+
+## What's new in v3.3.4
+
+Hermes UI 3.3.4 is a session-memory hotfix. It tightens the browser/server transcript repair so the compacted model context also receives the latest visible turns before Hermes answers.
+
+**Session context repair**
+- **Latest-turn memory repair** — browser-ahead transcript repair now refreshes the model-facing context tail too, preventing stale compact context from making Hermes forget the previous prompt/work
+- **Reference-aligned merge guards** — workspace-prefixed agent echoes and checkpointed current-user turns are deduped when compacted context is merged back into the visible transcript
+- **Server health endpoint** — `/api/session/health` reports server, browser, and compacted-context message counts for easier debugging
+- **Cleaner Tasks board** — Done receipts now age out after 2 hours, Needs You/blocked receipts after 12 hours, and the Tasks copy clarifies that it is current/recent work
+- **Privacy check** — release diff was checked for obvious token/API-key/personal-path leaks before shipping
+
+## What's new in v3.3.3
+
+Hermes UI 3.3.3 is a session safety and Tasks cleanup patch. It adds a quiet browser/server transcript health check before each chat turn and trims stale task receipts so the board stays focused on current work.
+
+**Session safety + task cleanup**
+- **Transcript safety check** — before each send, the browser-visible transcript is compared with the server session and safely repaired if the browser has newer visible chat history
+- **Server health endpoint** — `/api/session/health` reports server, browser, and compacted-context message counts for easier debugging
+- **Cleaner Tasks board** — Done receipts now age out after 2 hours, Needs You/blocked receipts after 12 hours, and the Tasks copy clarifies that it is current/recent work
 
 ## What's new in v3.3.2
 

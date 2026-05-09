@@ -269,7 +269,7 @@ def _set_last_workspace(path):
 # Current hermes-ui release version. Bump on every tagged release so the
 # /api/version endpoint can tell the UI when a newer release is available on
 # GitHub. Keep in sync with the git tag (e.g. "3.3" corresponds to v3.3).
-__version__ = "3.3.2"
+__version__ = "3.3.7"
 _GITHUB_RELEASES_API = "https://api.github.com/repos/pyrate-llama/hermes-ui/releases/latest"
 _HERMES_AGENT_RELEASES_API = "https://api.github.com/repos/NousResearch/hermes-agent/releases/latest"
 
@@ -786,11 +786,26 @@ def _message_text(content):
     return str(content or "")
 
 
+def _strip_workspace_prefix(text, include_legacy=True):
+    """Remove WebUI workspace/count prefixes when comparing visible turns."""
+    s = str(text or "")
+    if include_legacy:
+        s = re.sub(r"^\[Workspace:[^\n]*\]\n", "", s)
+    s = re.sub(r"^\[Workspace::v1:[^\n]*\]\n", "", s)
+    s = re.sub(r"^\[Visible transcript:[^\n]*\]\n", "", s)
+    return s
+
+
 def _message_identity(msg):
     if not isinstance(msg, dict):
         return None
     role = str(msg.get("role") or "")
     text = _message_text(msg.get("content", ""))
+    if role == "user":
+        # Agent results can echo the workspace/count-prefixed prompt while the
+        # visible UI bubble stores only the human text. Treat them as the same
+        # turn for dedupe and compaction merge, matching the reference UI.
+        text = _strip_workspace_prefix(text, include_legacy=True)
     if not text and not msg.get("tool_call_id") and not msg.get("tool_calls"):
         return None
     return (
@@ -829,10 +844,26 @@ def _find_current_user_turn(messages, msg_text):
         if not isinstance(msg, dict) or msg.get("role") != "user":
             continue
         fallback = idx
-        text = " ".join(_message_text(msg.get("content", "")).split())
+        text = " ".join(
+            _strip_workspace_prefix(
+                _message_text(msg.get("content", "")),
+                include_legacy=True,
+            ).split()
+        )
         if needle and (needle in text or text in needle):
             return idx
     return fallback
+
+
+def _drop_checkpointed_current_user_from_context(messages, msg_text):
+    """Return model history without an eager-checkpointed current user turn."""
+    history = list(messages or [])
+    if not history:
+        return history
+    current_user_key = _message_identity({"role": "user", "content": msg_text})
+    if current_user_key and _message_identity(history[-1]) == current_user_key:
+        return history[:-1]
+    return history
 
 
 def _merge_display_messages_after_agent_result(previous_display, previous_context, result_messages, msg_text):
@@ -856,15 +887,41 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
 
     merged = list(previous_display)
     seen = {_message_identity(m) for m in merged}
+    current_user_key = _message_identity({"role": "user", "content": msg_text})
+    current_user_in_candidates = any(
+        _message_identity(m) == current_user_key
+        for m in candidates
+    )
+    current_user_already_checkpointed = bool(
+        merged and _message_identity(merged[-1]) == current_user_key
+    )
+    if (
+        current_user_key is not None
+        and not current_user_in_candidates
+        and not current_user_already_checkpointed
+        and any(isinstance(m, dict) and m.get("role") in ("assistant", "tool") for m in candidates)
+    ):
+        current_user_msg = {"role": "user", "content": msg_text}
+        insert_at = 0
+        while insert_at < len(candidates) and _is_context_compression_marker(candidates[insert_at]):
+            insert_at += 1
+        candidates = candidates[:insert_at] + [current_user_msg] + candidates[insert_at:]
+
     for msg in candidates:
         ident = _message_identity(msg)
         if ident is None:
+            continue
+        if ident == current_user_key and merged and _message_identity(merged[-1]) == ident:
             continue
         if ident in seen:
             continue
         if _is_context_compression_marker(msg) and ident in seen:
             continue
-        merged.append(msg)
+        display_msg = msg
+        if ident == current_user_key and isinstance(msg, dict) and msg.get("role") == "user":
+            display_msg = dict(msg)
+            display_msg["content"] = msg_text
+        merged.append(display_msg)
         seen.add(ident)
     return merged
 
@@ -883,6 +940,190 @@ def _trim_model_history(messages):
         kept.append(msg)
         total_chars += size
     return _sanitize_messages_for_api(list(reversed(kept)))
+
+
+def _messages_have_tool_evidence(messages):
+    return any(
+        isinstance(msg, dict)
+        and (
+            msg.get("role") == "tool"
+            or msg.get("tool_calls")
+            or msg.get("toolCalls")
+        )
+        for msg in (messages or [])
+    )
+
+
+def _format_ui_tool_evidence(tool_calls):
+    parts = []
+    for tc in (tool_calls or [])[:12]:
+        if not isinstance(tc, dict):
+            continue
+        label = str(tc.get("label") or tc.get("toolName") or "tool")[:160]
+        status = "done" if tc.get("done") else "running"
+        result = tc.get("result")
+        result_text = ""
+        if result is not None:
+            try:
+                result_text = json.dumps(result, ensure_ascii=False, sort_keys=True)
+            except Exception:
+                result_text = str(result)
+            result_text = " => " + result_text[:500]
+        parts.append(f"{label} {status}{result_text}")
+    if not parts:
+        return ""
+    return "[Hermes UI tool evidence: " + "; ".join(parts) + "]"
+
+
+def _ui_tool_call_name(tool_call):
+    raw = str(
+        (tool_call or {}).get("toolName")
+        or (tool_call or {}).get("label")
+        or "hermes_ui_tool"
+    )
+    name = re.sub(r"[^A-Za-z0-9_]+", "_", raw).strip("_")[:64]
+    if not name:
+        name = "hermes_ui_tool"
+    if not re.match(r"^[A-Za-z_]", name):
+        name = "tool_" + name
+    return name
+
+
+def _recovered_ui_tool_receipt_message(tool_calls):
+    receipts = []
+    for tc in (tool_calls or [])[:12]:
+        if not isinstance(tc, dict):
+            continue
+        # UI toolCalls are generated from stream tool events, but they are
+        # display receipts, not provider-native assistant/tool message pairs.
+        # Keep provenance explicit so we do not forge tool history.
+        if not (tc.get("timestamp") and tc.get("toolName")):
+            continue
+        label = str(tc.get("label") or tc.get("toolName") or "tool")[:220]
+        status = "done" if tc.get("done") else "running"
+        duration = tc.get("duration")
+        duration_text = f", duration={duration:.2f}s" if isinstance(duration, (int, float)) else ""
+        result_note = "result_present" if tc.get("result") is not None else "result_not_captured"
+        receipts.append(
+            f"{tc.get('timestamp')} | {tc.get('toolName')} | {label} | {status}{duration_text} | {result_note}"
+        )
+    if not receipts:
+        return None
+    return {
+        "role": "assistant",
+        "content": (
+            "[Recovered UI-observed tool receipts; not provider-native tool_calls. "
+            "These mean Hermes UI observed tool events earlier. If result_not_captured, "
+            "verify the artifact/status with tools before claiming final state.]\n"
+            + "\n".join(receipts)
+        ),
+    }
+
+
+def _enrich_messages_with_ui_tool_evidence(messages):
+    """Convert browser-only toolCalls receipts into provenance-labeled context."""
+    enriched = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        enriched.append(msg)
+        receipt_msg = _recovered_ui_tool_receipt_message(msg.get("toolCalls"))
+        if receipt_msg:
+            enriched.append(receipt_msg)
+    return enriched
+
+
+def _assistant_denies_prior_tool_work(msg):
+    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+        return False
+    if msg.get("tool_calls"):
+        return False
+    text = " ".join(str(msg.get("content") or "").lower().split())
+    if not text:
+        return False
+    return bool(re.search(
+        r"(didn['’]?t actually run any tools|didn['’]?t run any tools|"
+        r"haven['’]?t actually started production|hadn['’]?t actually started|"
+        r"just confirming the schedule in my head|got ahead of myself|"
+        r"need the topic first|what is episode\s*013 about)",
+        text,
+    ))
+
+
+def _is_old_recovered_ui_tool_note(msg):
+    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+        return False
+    text = str(msg.get("content") or "")
+    return (
+        text.startswith("[Hermes UI tool evidence:")
+        or text.startswith("Recovered Hermes UI tool receipts from the visible chat.")
+    )
+
+
+def _is_recovered_ui_tool_receipt(msg):
+    return (
+        isinstance(msg, dict)
+        and msg.get("role") == "assistant"
+        and str(msg.get("content") or "").startswith("[Recovered UI-observed tool receipts;")
+    )
+
+
+def _remove_contradicted_tool_denials(messages):
+    """Drop bad self-corrections once recovered/prior tool evidence exists."""
+    cleaned = []
+    seen_tool_evidence = False
+    for msg in messages or []:
+        if _is_old_recovered_ui_tool_note(msg):
+            continue
+        if _messages_have_tool_evidence([msg]) or _is_recovered_ui_tool_receipt(msg):
+            seen_tool_evidence = True
+        if seen_tool_evidence and _assistant_denies_prior_tool_work(msg):
+            continue
+        cleaned.append(msg)
+    return cleaned
+
+
+def _load_ui_conversation_messages(session_id):
+    try:
+        if not os.path.exists(UI_CONVERSATIONS_FILE):
+            return []
+        with open(UI_CONVERSATIONS_FILE, "r", encoding="utf-8") as f:
+            conversations = json.load(f)
+        if not isinstance(conversations, list):
+            return []
+        for conv in conversations:
+            if not isinstance(conv, dict):
+                continue
+            if conv.get("id") == session_id:
+                messages = conv.get("messages")
+                return messages if isinstance(messages, list) else []
+    except Exception as e:
+        print(f"[serve] ui conversation recovery failed for {session_id}: {e}", flush=True)
+    return []
+
+
+def _merge_browser_repair_messages(server_messages, client_messages):
+    """Repair from browser transcript without erasing server-side tool evidence."""
+    server_clean = _sanitize_messages_for_api(server_messages or [])
+    client_clean = _sanitize_messages_for_api(
+        _enrich_messages_with_ui_tool_evidence(client_messages or [])
+    )
+    if not server_clean:
+        return client_clean
+    if not client_clean:
+        return server_clean
+    if not _messages_have_tool_evidence(server_clean):
+        return client_clean
+
+    merged = list(server_clean)
+    seen = {_message_identity(msg) for msg in merged}
+    for msg in client_clean:
+        ident = _message_identity(msg)
+        if ident is None or ident in seen:
+            continue
+        merged.append(msg)
+        seen.add(ident)
+    return _sanitize_messages_for_api(merged)
 
 
 def _assistant_claims_local_work_without_tools(msg):
@@ -978,6 +1219,18 @@ SESSION_DIR = os.path.join(HERMES_HOME, "hermes-ui", "sessions")
 os.makedirs(SESSION_DIR, exist_ok=True)
 SESSION_ALIASES_FILE = os.path.join(HERMES_HOME, "hermes-ui", "session-aliases.json")
 WORK_ITEMS_FILE = os.path.join(HERMES_HOME, "hermes-ui", "work-items.json")
+UI_CONVERSATIONS_FILE = os.path.join(HERMES_HOME, "ui-conversations.json")
+WORK_ITEM_DONE_RETENTION_SEC = 2 * 60 * 60
+WORK_ITEM_BLOCKED_RETENTION_SEC = 12 * 60 * 60
+
+
+def _work_item_retention_seconds(item):
+    """Return how long a completed/blocked task receipt should stay visible."""
+    status = str((item or {}).get("status") or "")
+    column = str((item or {}).get("column") or "")
+    if status == "done" or column == "done":
+        return WORK_ITEM_DONE_RETENTION_SEC
+    return WORK_ITEM_BLOCKED_RETENTION_SEC
 
 
 def _utc_now_iso():
@@ -995,8 +1248,9 @@ def _save_work_items():
         for item in items:
             updated_ts = item.get("_updated_ts") or now
             status = str(item.get("status") or "")
-            # Keep active work plus one day of receipts/errors.
-            if status in ("running", "waiting") or (now - updated_ts) <= 24 * 60 * 60:
+            # Keep active work plus short, useful receipts. Older "Done" and
+            # "Needs You" items made the Tasks board feel stale.
+            if status in ("running", "waiting") or (now - updated_ts) <= _work_item_retention_seconds(item):
                 public = {k: v for k, v in item.items() if not str(k).startswith("_")}
                 public["_updated_ts"] = updated_ts
                 trimmed.append(public)
@@ -1024,7 +1278,10 @@ def _load_work_items():
                 if not stream_id:
                     continue
                 updated_ts = float(raw.get("_updated_ts") or now)
-                if str(raw.get("status") or "") not in ("running", "waiting") and (now - updated_ts) > 24 * 60 * 60:
+                if (
+                    str(raw.get("status") or "") not in ("running", "waiting")
+                    and (now - updated_ts) > _work_item_retention_seconds(raw)
+                ):
                     continue
                 item = dict(raw)
                 item["_updated_ts"] = updated_ts
@@ -1244,6 +1501,83 @@ def _get_or_create_session(session_id):
     with SESSIONS_LOCK:
         SESSIONS[session_id] = new_session
     return new_session
+
+
+def _count_role_messages(messages, role):
+    return sum(
+        1 for msg in (messages or [])
+        if isinstance(msg, dict) and msg.get("role") == role
+    )
+
+
+def _session_health_snapshot(session_id, client_messages=None, repair_from_client=False):
+    """Compare server and browser transcript counts, repairing safe browser-ahead drift."""
+    session_id = _resolve_session_id(session_id)
+    session = _get_or_create_session(session_id)
+    server_messages = list(session.get("messages") or [])
+    context_messages = list(_context_messages_for_session(session))
+    if not isinstance(client_messages, list):
+        client_messages = _load_ui_conversation_messages(session_id)
+    client_enriched = _enrich_messages_with_ui_tool_evidence(client_messages or []) if isinstance(client_messages, list) else []
+    client_clean = _sanitize_messages_for_api(client_enriched)
+    server_user_count = _count_role_messages(server_messages, "user")
+    client_user_count = _count_role_messages(client_clean, "user") if client_clean else None
+    server_has_tool_evidence = _messages_have_tool_evidence(server_messages)
+    client_has_tool_evidence = _messages_have_tool_evidence(client_enriched)
+    repaired = False
+    warning = ""
+
+    if client_clean and client_user_count is not None:
+        if client_user_count > server_user_count:
+            if repair_from_client:
+                repaired_messages = _merge_browser_repair_messages(server_messages, client_clean)
+                session["messages"] = repaired_messages
+                session["context_messages"] = _trim_model_history(
+                    _remove_contradicted_tool_denials(repaired_messages)
+                )
+                session["recovered_at"] = _utc_now_iso()
+                _save_session(session_id, session)
+                server_messages = list(repaired_messages)
+                context_messages = list(session.get("context_messages") or [])
+                server_user_count = _count_role_messages(server_messages, "user")
+                repaired = True
+                warning = "browser_transcript_repaired"
+            else:
+                warning = "browser_ahead_of_server"
+        elif client_has_tool_evidence and not server_has_tool_evidence:
+            if repair_from_client:
+                repaired_messages = _merge_browser_repair_messages(server_messages, client_messages)
+                session["messages"] = repaired_messages
+                session["context_messages"] = _trim_model_history(
+                    _remove_contradicted_tool_denials(repaired_messages)
+                )
+                session["recovered_at"] = _utc_now_iso()
+                _save_session(session_id, session)
+                server_messages = list(repaired_messages)
+                context_messages = list(session.get("context_messages") or [])
+                server_user_count = _count_role_messages(server_messages, "user")
+                repaired = True
+                warning = "browser_tool_evidence_repaired"
+            else:
+                warning = "browser_has_tool_evidence_missing_on_server"
+        elif server_user_count > client_user_count + 1:
+            warning = "server_ahead_of_browser"
+
+    context_user_count = _count_role_messages(context_messages, "user")
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "server_messages": len(server_messages),
+        "server_user_prompts": server_user_count,
+        "client_messages": len(client_clean) if client_clean else None,
+        "client_user_prompts": client_user_count,
+        "context_messages": len(context_messages),
+        "context_user_prompts": context_user_count,
+        "context_compacted": bool(server_user_count and context_user_count < server_user_count),
+        "repaired": repaired,
+        "warning": warning,
+        "checked_at": _utc_now_iso(),
+    }
 
 
 def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="", reasoning_effort="", workspace=None, model_override=""):
@@ -1597,8 +1931,16 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
             "the model-facing context has been compacted. If the user asks how "
             "many prompts/messages are in this chat, use the Visible transcript "
             "counts instead of counting only the compact context you can see.\n"
-            "Do not claim local file/process work is complete unless you actually "
-            "used a tool in this turn and observed the result."
+            "Do not claim new local file/process work is complete unless you actually "
+            "used a tool in this turn and observed the result. If the prior transcript "
+            "says earlier work was completed but tool metadata is missing, do not "
+            "contradict that transcript or ask for already-provided basics; treat it "
+            "as unverified prior state, say you will verify the artifact/status, and "
+            "use tools before continuing. Recovered UI-observed tool receipts are "
+            "evidence that Hermes UI saw tool events in an earlier turn, but they are "
+            "not provider-native tool messages; do not say no tools ran when those "
+            "receipts exist, and verify any result_not_captured artifact before "
+            "claiming final status."
         )
 
         # Prefer the model-facing context when available. The UI transcript can
@@ -1606,7 +1948,10 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
         # a last resort, matching Reference's display-vs-context split.
         session = _get_or_create_session(session_id)
         _previous_messages = list(session.get("messages") or [])
-        _previous_context_messages = list(_context_messages_for_session(session))
+        _previous_context_messages = _drop_checkpointed_current_user_from_context(
+            _remove_contradicted_tool_denials(_context_messages_for_session(session)),
+            user_msg,
+        )
         _has_context_messages = isinstance(session.get("context_messages"), list) and bool(session.get("context_messages"))
         _server_user_count = sum(1 for _m in _previous_messages if _m.get("role") == "user")
         _client_user_count = sum(1 for _m in messages if isinstance(_m, dict) and _m.get("role") == "user")
@@ -1618,11 +1963,16 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
                 "repairing server transcript from frontend",
                 flush=True,
             )
-            _previous_messages = _sanitize_messages_for_api(messages)
-            if _has_context_messages:
-                clean_history = _trim_model_history(_previous_context_messages)
-            else:
-                clean_history = _limited_fallback_history(messages)
+            _previous_messages = _merge_browser_repair_messages(_previous_messages, messages)
+            # The browser-visible transcript is ahead, so the persisted
+            # compact context may be stale. Rebuild the model-facing tail from
+            # the repaired transcript for this turn; the final result will
+            # compact it again after the agent returns.
+            _previous_context_messages = _drop_checkpointed_current_user_from_context(
+                _trim_model_history(_remove_contradicted_tool_denials(_previous_messages)),
+                user_msg,
+            )
+            clean_history = list(_previous_context_messages)
         else:
             clean_history = (
                 _trim_model_history(_previous_context_messages)
@@ -1719,7 +2069,7 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
             _result_messages = result.get("messages") or session.get("messages") or []
             session["context_messages"] = _restore_reasoning_metadata(
                 _previous_context_messages,
-                _trim_model_history(_remove_promise_only_tail(_result_messages)),
+                _trim_model_history(_remove_contradicted_tool_denials(_remove_promise_only_tail(_result_messages))),
             )
             _merged = _merge_display_messages_after_agent_result(
                 _previous_messages,
@@ -2276,7 +2626,7 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
             for stream_id, item in list(WORK_ITEMS.items()):
                 updated_ts = item.get("_updated_ts") or now
                 status = str(item.get("status") or "")
-                if status not in ("running", "waiting") and (now - updated_ts) > 24 * 60 * 60:
+                if status not in ("running", "waiting") and (now - updated_ts) > _work_item_retention_seconds(item):
                     WORK_ITEMS.pop(stream_id, None)
                     changed = True
                     continue
@@ -2285,6 +2635,23 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
             _save_work_items()
         items.sort(key=lambda item: item.get("updated_at") or item.get("created_at") or "", reverse=True)
         self._json({"ok": True, "items": items[:200]})
+
+    def _handle_session_health(self):
+        """Report and optionally repair browser/server transcript drift."""
+        body = self._read_json_body_optional()
+        session_id = body.get("session_id") or self.headers.get("X-Hermes-Session-Id") or ""
+        if not session_id:
+            try:
+                parsed = urllib.parse.urlparse(self.path)
+                session_id = (urllib.parse.parse_qs(parsed.query).get("session_id") or [""])[0]
+            except Exception:
+                session_id = ""
+        if not session_id:
+            return self._json({"ok": False, "error": "session_id required"}, 400)
+        messages = body.get("messages")
+        repair = bool(body.get("repair"))
+        snapshot = _session_health_snapshot(session_id, messages, repair_from_client=repair)
+        self._json(snapshot)
 
     def _handle_work_item_update(self):
         """Manual Tasks board controls: dismiss or mark a server work item done."""
@@ -2513,7 +2880,7 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
             self._json({"ok": False, "error": str(e)}, 500)
 
     # ── UI conversations (local JSON file) ──
-    CONV_PATH = os.path.join(HERMES_HOME, "ui-conversations.json")
+    CONV_PATH = UI_CONVERSATIONS_FILE
 
     def _conversations_load(self):
         try:
@@ -3491,6 +3858,8 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
             self._handle_chat_stream_status()
         elif self.path == "/api/work-items" or self.path.startswith("/api/work-items?"):
             self._handle_work_items()
+        elif self.path == "/api/session/health" or self.path.startswith("/api/session/health?"):
+            self._handle_session_health()
         elif self.path.startswith("/api/chat/stream"):
             self._handle_chat_stream()
         elif self.path.startswith("/api/chat/cancel"):
@@ -3555,6 +3924,8 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
             self._handle_chat_steer()
         elif self.path == "/api/work-items":
             self._handle_work_item_update()
+        elif self.path == "/api/session/health":
+            self._handle_session_health()
         elif self.path == "/v1/chat/completions" or self.path == "/api/chat":
             self._handle_chat_start()  # backwards compat — same two-step flow
         elif self.path.startswith("/terminal/exec"):

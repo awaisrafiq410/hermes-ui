@@ -4337,8 +4337,8 @@ function contentSuggestsBackgroundFollowup(message) {
   return messageClaimsLocalWorkWithoutTools(message);
 }
 
-var TASK_DONE_RETENTION_MS = 6 * 60 * 60 * 1000;
-var TASK_NEEDS_YOU_RETENTION_MS = 24 * 60 * 60 * 1000;
+var TASK_DONE_RETENTION_MS = 2 * 60 * 60 * 1000;
+var TASK_NEEDS_YOU_RETENTION_MS = 12 * 60 * 60 * 1000;
 
 function shouldKeepTaskBoardItem(column, updated, active) {
   if (column === 'active') return true;
@@ -4564,7 +4564,7 @@ function TasksView({ conversations, streamingSessionIds, agentStateBySession, ac
         <div className="tasks-toolbar-copy">
           <div className="tasks-toolbar-title"><Icon name="list-todo" size={17}/> Tasks</div>
           <div className="tasks-toolbar-subtitle">
-            Live board built from Hermes todos, active tools, background follow-ups, subagents, and chat work. Click any card to jump back to its source chat.
+            Current and recent Hermes todos, active tools, background follow-ups, subagents, and chat work. Click any card to jump back to its source chat.
           </div>
         </div>
         <input className="tasks-filter" value={filter} onChange={function(e){ setFilter(e.target.value); }} placeholder="Filter tasks..." />
@@ -8472,7 +8472,7 @@ function StatusBar({ connected, conversations, messages, sessionTokens, versionI
         )}
       </div>
       <div className="status-bar-item status-bar-version" style={{opacity:0.5}}>
-        <span>Hermes UI v3.3.2</span>
+        <span>Hermes UI v3.3.7</span>
       </div>
     </div>
   );
@@ -9551,8 +9551,25 @@ function App() {
       if (messageHistory && messageHistory.length > 0) {
         for (var mi = 0; mi < messageHistory.length; mi++) {
           var m = messageHistory[mi];
-          if ((m.role === 'user' || m.role === 'assistant') && m.content) {
-            apiMessages.push({ role: m.role, content: m.content });
+          if (!m || (m.role !== 'user' && m.role !== 'assistant' && m.role !== 'tool')) continue;
+          if (!m.content && !m.tool_calls && !m.tool_call_id) continue;
+          var apiMsg = { role: m.role };
+          if (m.content != null) apiMsg.content = m.content;
+          if (m.tool_calls) apiMsg.tool_calls = m.tool_calls;
+          if (m.tool_call_id) apiMsg.tool_call_id = m.tool_call_id;
+          if (m.name) apiMsg.name = m.name;
+          if (m.refusal) apiMsg.refusal = m.refusal;
+          apiMessages.push(apiMsg);
+          if ((m.toolCalls || []).length) {
+            apiMessages.push({
+              role: 'assistant',
+              content: '[Hermes UI tool evidence: ' + m.toolCalls.map(function(tc) {
+                var label = tc.label || tc.toolName || 'tool';
+                var status = tc.done ? 'done' : 'running';
+                var result = tc.result ? (' => ' + JSON.stringify(tc.result).slice(0, 400)) : '';
+                return label + ' ' + status + result;
+              }).join('; ') + ']'
+            });
           }
         }
       }
@@ -9568,6 +9585,29 @@ function App() {
         if (apiMessages[_lastIdx].role === 'user') {
           apiMessages[_lastIdx] = Object.assign({}, apiMessages[_lastIdx], { images: _imgs });
         }
+      }
+      // Reference-style safety check: keep the full browser-visible transcript
+      // aligned with the server before each send, while model context can stay
+      // compacted separately.
+      try {
+        const healthResp = await fetch(API_BASE + '/api/session/health', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            session_id: sessionId,
+            messages: apiMessages,
+            repair: true,
+          }),
+          signal: signal,
+        });
+        if (healthResp.ok) {
+          const healthData = await healthResp.json();
+          if (healthData && (healthData.repaired || healthData.warning)) {
+            console.log('[session-health]', healthData);
+          }
+        }
+      } catch(e) {
+        console.warn('[session-health] check skipped:', e);
       }
       // Step 1: POST to /api/chat/start to get stream_id
       emitStatus({ kind: 'thinking', label: 'Starting', detail: 'Opening stream' });
@@ -12053,7 +12093,7 @@ function App() {
                     {agentInstalledVersion && (
                       <span className="status-bar-item status-bar-version">Hermes Agent v{agentInstalledVersion}</span>
                     )}
-                    <span className="status-bar-item status-bar-version">Hermes UI v3.3.2</span>
+                    <span className="status-bar-item status-bar-version">Hermes UI v3.3.7</span>
                     <a className="composer-chip status-icon-btn" href="https://github.com/pyrate-llama/hermes-ui/issues" target="_blank" rel="noopener noreferrer" title="Open Hermes UI issues on GitHub">
                       <Icon name="message-square" size={12}/>
                     </a>
