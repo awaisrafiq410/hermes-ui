@@ -272,7 +272,7 @@ def _set_last_workspace(path):
 # Current hermes-ui release version. Bump on every tagged release so the
 # /api/version endpoint can tell the UI when a newer release is available on
 # GitHub. Keep in sync with the git tag (e.g. "3.3" corresponds to v3.3).
-__version__ = "3.3.10"
+__version__ = "3.3.11"
 _GITHUB_RELEASES_API = "https://api.github.com/repos/pyrate-llama/hermes-ui/releases/latest"
 _HERMES_AGENT_RELEASES_API = "https://api.github.com/repos/NousResearch/hermes-agent/releases/latest"
 
@@ -752,16 +752,6 @@ def _sanitize_messages_for_api(messages):
     return clean
 
 
-def _context_messages_for_session(session):
-    """Return model-facing history, keeping long UI transcripts out of prompts."""
-    if isinstance(session, dict):
-        context_messages = session.get("context_messages")
-        if isinstance(context_messages, list) and context_messages:
-            return context_messages
-        return session.get("messages") or []
-    return []
-
-
 def _limited_fallback_history(messages):
     """Last-resort browser-history repair, capped to avoid huge prompt bloat."""
     clean = _sanitize_messages_for_api(messages)
@@ -960,6 +950,35 @@ def _is_context_compression_marker(msg):
         or "context was auto-compressed" in text
         or "active task list was preserved across context compression" in text
     )
+
+
+def _messages_have_context_compression_marker(messages):
+    return any(_is_context_compression_marker(msg) for msg in (messages or []))
+
+
+def _context_messages_for_session(session):
+    """Return model-facing history without trusting stale compact context.
+
+    Older builds could save a tiny ``context_messages`` tail while the full
+    visible transcript stayed intact in ``messages``. If no compression marker
+    exists, that tail is stale projection, not real compression, so rebuild from
+    the full transcript.
+    """
+    if not isinstance(session, dict):
+        return []
+    display_messages = session.get("messages") or []
+    context_messages = session.get("context_messages")
+    if isinstance(context_messages, list) and context_messages:
+        display_users = _count_role_messages(display_messages, "user")
+        context_users = _count_role_messages(context_messages, "user")
+        if (
+            display_users
+            and context_users < display_users
+            and not _messages_have_context_compression_marker(display_messages)
+        ):
+            return display_messages
+        return context_messages
+    return display_messages
 
 
 def _find_current_user_turn(messages, msg_text):

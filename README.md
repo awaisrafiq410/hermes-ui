@@ -6,7 +6,7 @@ The command center for [Hermes Agent](https://github.com/pyrate-llama/hermes-age
 
 Built as a single-file HTML application with React 18, Hermes UI provides a full-featured chat interface, real-time log streaming, file browsing, memory inspection, and more — all through a lightweight Python proxy server.
 
-![v3.3.10](https://img.shields.io/badge/version-3.3.10-ef4444?style=for-the-badge)
+![v3.3.11](https://img.shields.io/badge/version-3.3.11-ef4444?style=for-the-badge)
 ![Single file HTML](https://img.shields.io/badge/architecture-single_file-44d88a?style=for-the-badge)
 ![React 18](https://img.shields.io/badge/react-18.2-61dafb?style=for-the-badge)
 
@@ -36,6 +36,15 @@ Built as a single-file HTML application with React 18, Hermes UI provides a full
 ![Built-in terminal area with Hermes and Claude Code tabs](screenshots/terminal.png)
 
 ---
+
+## What's new in v3.3.11
+
+Hermes UI 3.3.11 fixes stale compact context that could make an active chat look reset.
+
+**Session continuity**
+- **Stale context repair** — if `context_messages` has fewer user turns than the saved transcript and no real compression marker exists, Hermes rebuilds from the full transcript
+- **No false reset** — chats with dozens of visible prompts no longer start the next turn from a two-prompt backend tail
+- **Health counts fixed** — session health now reports context from the repaired source instead of stale compact state
 
 ## What's new in v3.3.10
 
