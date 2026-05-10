@@ -4821,6 +4821,22 @@ function SubagentToolCard({ tool, index, expanded, onToggle, formatResult }) {
  * Persisted as role='compaction-reference' in the message array
  * so it survives page refresh.
  */
+// Detect context compaction summary messages (nesquena-aligned).
+// These are injected by the agent as regular user/assistant messages
+// but should be rendered as collapsible reference cards, not chat bubbles.
+function _isContextCompactionMessage(msg) {
+  if (!msg || !msg.content) return false;
+  var text = typeof msg.content === 'string' ? msg.content : '';
+  if (typeof msg.content === 'object' && Array.isArray(msg.content)) {
+    text = msg.content.map(function(p) { return (p && p.text) || ''; }).join(' ');
+  }
+  text = text.trimStart().toLowerCase();
+  return text.indexOf('[context compaction') === 0
+    || text.indexOf('context compaction') === 0
+    || text.indexOf('[context compression') === 0
+    || text.indexOf('context compression') === 0;
+}
+
 function CompactionReferenceCard({ content, index }) {
   var _crcOpen = React.useState(false);
   var isOpen = _crcOpen[0];
@@ -9737,6 +9753,9 @@ function App() {
           var m = messageHistory[mi];
           if (!m || (m.role !== 'user' && m.role !== 'assistant' && m.role !== 'tool')) continue;
           if (!m.content && !m.tool_calls && !m.tool_call_id) continue;
+          // Skip compaction summary messages — the agent manages these
+          // server-side; sending them back causes the model to restate them.
+          if (_isContextCompactionMessage(m)) continue;
           var apiMsg = { role: m.role };
           if (m.content != null) apiMsg.content = m.content;
           if (m.tool_calls) apiMsg.tool_calls = m.tool_calls;
@@ -12077,7 +12096,7 @@ function App() {
                         <span className="compaction-label">{'🔄'} {msg.content}</span>
                         <div className="compaction-line" />
                       </div>
-                    ) : msg.role === 'compaction-reference' ? (
+                    ) : (msg.role === 'compaction-reference' || _isContextCompactionMessage(msg)) ? (
                       <CompactionReferenceCard key={msg.id} content={msg.content} index={idx} />
                     ) : msg.role === 'aside' ? (
                       <AsideBubble key={msg.id} message={msg} index={idx} />
