@@ -58,16 +58,19 @@
     content: ''; position: fixed; top: -30%; left: -10%; width: 55%; height: 75%;
     background: radial-gradient(ellipse, rgba(124,111,224,0.10) 0%, transparent 65%);
     pointer-events: none; z-index: 0; animation: ambientDrift1 14s ease-in-out infinite alternate;
+    will-change: transform;
   }
   .app::after {
     content: ''; position: fixed; bottom: -20%; right: -5%; width: 50%; height: 65%;
     background: radial-gradient(ellipse, rgba(68,216,138,0.07) 0%, transparent 65%);
     pointer-events: none; z-index: 0; animation: ambientDrift2 17s ease-in-out infinite alternate;
+    will-change: transform;
   }
   .ambient-glow-3 {
     content: ''; position: fixed; top: 40%; left: 30%; width: 40%; height: 50%;
     background: radial-gradient(ellipse, rgba(200,160,255,0.05) 0%, transparent 70%);
     pointer-events: none; z-index: 0; animation: ambientDrift3 20s ease-in-out infinite alternate;
+    will-change: transform;
   }
   /* Vignette edges — subtle darker corners for depth */
   .app-vignette {
@@ -96,6 +99,31 @@
   @keyframes ambientDrift1 { from { transform: translate(0,0); } to { transform: translate(5%,3%); } }
   @keyframes ambientDrift2 { from { transform: translate(0,0); } to { transform: translate(-3%,-2%); } }
   @keyframes ambientDrift3 { from { transform: translate(-4%,0); } to { transform: translate(4%,-3%); } }
+
+  /* ── Performance: reduce GPU pressure on browsers with weak backdrop-filter (Firefox) ── */
+  @supports not (backdrop-filter: blur(1px)) {
+    .sidebar, .header, .input-area, .settings-panel, .file-browser,
+    .tool-call-wrapper, .message, .aside-panel, .delegation-panel {
+      background: var(--bg-secondary) !important;
+    }
+  }
+  html.firefox .sidebar,
+  html.firefox .header,
+  html.firefox .input-area,
+  html.firefox .message {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+    background: var(--bg-secondary) !important;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .app::before, .app::after, .ambient-glow-3 { animation: none !important; }
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+
   .app > * { position: relative; z-index: 1; }
 
   .sidebar {
@@ -3159,6 +3187,12 @@
   }
 
   </style>
+<script>
+  // Firefox performance: disable expensive backdrop-filter blur
+  if (navigator.userAgent.indexOf('Firefox') !== -1) {
+    document.documentElement.classList.add('firefox');
+  }
+</script>
 </head>
 <body>
 <div id="root"></div>
@@ -4754,7 +4788,7 @@ function MessageBubble({ message, onImageClick, onEdit, onRetry, index, highligh
   var reasoningItems = Array.isArray(message.reasoning) ? message.reasoning : [];
   var reasoningText = reasoningItems.map(function(item) {
     return typeof item === 'string' ? item : (item && item.text) || '';
-  }).filter(Boolean).join('\n');
+  }).filter(Boolean).join('\n\n');
   var stoppedBeforeFollowup = messageNeedsFollowupAfterStopping(message);
   var showToollessWorkWarning = messageClaimsLocalWorkWithoutTools(message) || stoppedBeforeFollowup;
 
@@ -4889,7 +4923,7 @@ function MessageBubble({ message, onImageClick, onEdit, onRetry, index, highligh
 }
 
 /* ── Settings Modal ── */
-function SettingsModal({ config, onSave, onClose, mcpToolCount }) {
+function SettingsModal({ config, onSave, onClose, mcpToolCount, hideBgImage, setHideBgImage }) {
   const [geminiKey, setGeminiKey] = useState(config.geminiKey || '');
   const [imageHelperMode, setImageHelperMode] = useState(normalizeImageHelperMode(config.imageHelperMode));
   const [imageHelperModel, setImageHelperModel] = useState(normalizeImageHelperModel(config.imageHelperModel));
@@ -5141,6 +5175,15 @@ function SettingsModal({ config, onSave, onClose, mcpToolCount }) {
                 Adds four coding principles: <em>Think Before Coding, Simplicity First, Surgical Changes, Goal-Driven Execution</em>.
                 <br />
                 <strong style={{color:'var(--text-primary)'}}>Open a new chat to apply changes.</strong> Existing chats keep the setting they started with.
+              </div>
+            </div>
+            <div className="modal-section">
+              <label className="modal-label" style={{display:'flex',alignItems:'center',gap:'8px',cursor:'pointer',marginBottom:'4px'}}>
+                <input type="checkbox" checked={!hideBgImage} onChange={function(e) { var hide = !e.target.checked; localStorage.setItem('hermes-hide-bg-image', JSON.stringify(hide)); setHideBgImage(hide); }} style={{cursor:'pointer',margin:0}} />
+                <span>Show background image</span>
+              </label>
+              <div style={{fontSize:'11px',color:'var(--text-secondary)',marginTop:'6px',lineHeight:'1.5',paddingLeft:'22px'}}>
+                Display the decorative background image overlay. Disable if you find it distracting or prefer a cleaner look.
               </div>
             </div>
             <div className="config-panel">
@@ -9034,6 +9077,9 @@ function App() {
   const [customModelDraft, setCustomModelDraft] = useState('');
   const activeChatModel = selectedChatModel || currentModel;
   const [showSettings, setShowSettings] = useState(false);
+  const [hideBgImage, setHideBgImage] = useState(function() {
+    try { return JSON.parse(localStorage.getItem('hermes-hide-bg-image') || 'false'); } catch(e) { return false; }
+  });
   const [pendingImages, setPendingImages] = useState([]);
   const [pendingFiles, setPendingFiles] = useState([]);
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
@@ -9188,6 +9234,7 @@ function App() {
   const [showReasoningMenu, setShowReasoningMenu] = useState(false);
   const [slashCommandIndex, setSlashCommandIndex] = useState(0);
   const [slashMenuDismissed, setSlashMenuDismissed] = useState(false);
+  const [skillSlashCommands, setSkillSlashCommands] = useState([]);
   const [asideMode, setAsideMode] = useState(false);
   const [asideSending, setAsideSending] = useState(false);
   const [reasoningEffort, setReasoningEffort] = useState(function() {
@@ -9241,7 +9288,7 @@ function App() {
   };
   useEffect(function() {
     refreshServerWorkItems();
-    var iv = setInterval(refreshServerWorkItems, 5000);
+    var iv = setInterval(refreshServerWorkItems, 10000);
     return function() { clearInterval(iv); };
   }, []);
 
@@ -9295,11 +9342,42 @@ function App() {
       .catch(function() {});
   }, []);
 
+  // Fetch skills for slash command autocomplete (matches nesquena webui pattern)
+  useEffect(function() {
+    fetch(API_BASE + '/api/skills')
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        var skills = (d && Array.isArray(d.skills)) ? d.skills : [];
+        var cmds = [];
+        var seen = {};
+        skills.forEach(function(skill) {
+          var name = String(skill.name || '').trim().toLowerCase()
+            .replace(/[\s_]+/g, '-').replace(/[^a-z0-9-]/g, '').replace(/-{2,}/g, '-').replace(/^-+|-+$/g, '');
+          if (name && !seen[name]) {
+            seen[name] = true;
+            cmds.push({
+              name: name,
+              icon: 'sparkles',
+              summary: String(skill.description || '').trim().slice(0, 80) || 'Run skill',
+              isSkill: true,
+              skillName: skill.name,
+              sendAsMessage: true,
+              run: function() { /* handled by executeSlashCommand sendAsMessage path */ },
+            });
+          }
+        });
+        cmds.sort(function(a, b) { return a.name.localeCompare(b.name); });
+        setSkillSlashCommands(cmds);
+      })
+      .catch(function() {});
+  }, []);
+
   useEffect(function() {
     try { localStorage.setItem('hermes-personality', normalizePersonality(personality)); } catch(e) {}
   }, [personality]);
 
   const textareaRef = useRef(null);
+  const sendMessageRef = useRef(null);
   const messagesViewportRef = useRef(null);
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -9337,7 +9415,7 @@ function App() {
       }
     };
     checkHealth();
-    const interval = setInterval(checkHealth, 5000);
+    const interval = setInterval(checkHealth, 15000);
     return () => clearInterval(interval);
   }, []);
 
@@ -10940,8 +11018,14 @@ function App() {
                 var last = updated[updated.length - 1];
                 if (last && last.role === 'assistant' && last.streaming) {
                   var nextReasoning = (last.reasoning || []).slice();
-                  if (reasoningNote && nextReasoning[nextReasoning.length - 1]?.text !== reasoningNote) {
-                    nextReasoning.push({ text: reasoningNote, timestamp: new Date().toISOString() });
+                  // Concatenate into a single entry instead of one-per-token
+                  if (reasoningNote) {
+                    if (nextReasoning.length > 0) {
+                      var lastEntry = nextReasoning[nextReasoning.length - 1];
+                      nextReasoning[nextReasoning.length - 1] = { ...lastEntry, text: (lastEntry.text || '') + reasoningNote };
+                    } else {
+                      nextReasoning.push({ text: reasoningNote, timestamp: new Date().toISOString() });
+                    }
                   }
                   updated[updated.length - 1] = { ...last, thinking: true, reasoning: nextReasoning.slice(-24) };
                 }
@@ -11123,6 +11207,8 @@ function App() {
       // from updateStreamMessages calls during streaming.
     }
   };
+
+  sendMessageRef.current = sendMessage;
 
   const retryFromMessage = async (messageIndex) => {
     if (!activeConvId || isStreaming) return;
@@ -11395,7 +11481,12 @@ function App() {
         var lines = slashCommands.map(function(c) {
           return '/' + c.name + (c.usage ? ' ' + c.usage : '') + ' - ' + c.summary;
         });
-        pushLocalAssistantMessage('**Slash commands**\n\n' + lines.join('\n'));
+        var skillLines = skillSlashCommands.map(function(c) {
+          return '/' + c.name + ' - ' + c.summary + ' *(skill)*';
+        });
+        var out = '**Slash commands**\n\n' + lines.join('\n');
+        if (skillLines.length) out += '\n\n**Skills** (' + skillLines.length + ')\n\n' + skillLines.join('\n');
+        pushLocalAssistantMessage(out);
       },
     },
     { name: 'new', icon: 'plus', summary: 'Start a new chat', run: function() { newConversation(); setCurrentView('chat'); } },
@@ -11456,11 +11547,17 @@ function App() {
   };
 
   const slashInput = parseSlashInput(input);
+  // Merge builtin + skill slash commands (builtin wins on name collision)
+  const allSlashCommands = slashCommands.concat(
+    skillSlashCommands.filter(function(sc) {
+      return !slashCommands.some(function(bc) { return bc.name === sc.name; });
+    })
+  );
   const slashCommandMatches = slashInput && !slashMenuDismissed
-    ? slashCommands.filter(function(cmd) {
+    ? allSlashCommands.filter(function(cmd) {
         var q = slashInput.name;
         return !q || cmd.name.indexOf(q) === 0 || cmd.summary.toLowerCase().indexOf(q) !== -1;
-      }).slice(0, 9)
+      }).slice(0, 12)
     : [];
   const showSlashCommandMenu = !!(slashInput && !slashMenuDismissed && slashCommandMatches.length);
   const activeSlashCommand = slashCommandMatches[Math.min(slashCommandIndex, Math.max(0, slashCommandMatches.length - 1))] || null;
@@ -11473,6 +11570,15 @@ function App() {
       return true;
     }
     var value = args || '';
+    // Skill commands: send as a chat message to the agent (not handled locally)
+    if (command.sendAsMessage) {
+      var prompt = '/' + command.name + (value ? ' ' + value : '');
+      setInput('');
+      setSlashMenuDismissed(true);
+      addLocalLog('INFO  [skill] ' + prompt.slice(0, 80));
+      if (sendMessageRef.current) sendMessageRef.current(prompt);
+      return true;
+    }
     setInput('');
     setSlashMenuDismissed(true);
     addLocalLog('INFO  [command] /' + command.name + (value ? ' ' + value.slice(0, 80) : ''));
@@ -11485,7 +11591,7 @@ function App() {
   const runSlashCommandFromComposer = function(preferHighlighted) {
     var parsed = parseSlashInput(input);
     if (!parsed) return false;
-    var exact = slashCommands.find(function(cmd) { return cmd.name === parsed.name; });
+    var exact = allSlashCommands.find(function(cmd) { return cmd.name === parsed.name; });
     var command = (preferHighlighted && activeSlashCommand) || exact;
     if (!command) return false;
     if (preferHighlighted && activeSlashCommand && !parsed.hasArgs && activeSlashCommand.name !== parsed.name) {
@@ -11610,7 +11716,7 @@ function App() {
   return (
     <div className="app-wrapper">
     {/* Depth layers — rendered outside .app because .app > * forces position:relative */}
-    <div className="app-filler-bg" aria-hidden="true"><img src="/filler-bg.png" alt="" fetchpriority="low" /></div>
+    {!hideBgImage && <div className="app-filler-bg" aria-hidden="true"><img src="/filler-bg.png" alt="" fetchpriority="low" /></div>}
     <div className="ambient-glow-3" aria-hidden="true"></div>
     <div className="app-vignette" aria-hidden="true"></div>
     <div className="app-noise" aria-hidden="true"></div>
@@ -12045,6 +12151,7 @@ function App() {
                                 </span>
                                 <span className="slash-command-summary">{cmd.summary}</span>
                               </span>
+                              {cmd.isSkill && <span className="slash-command-chip" style={{background:'rgba(68,216,138,0.15)',color:'var(--success)',border:'1px solid rgba(68,216,138,0.3)'}}>Skill</span>}
                               <span className="slash-command-chip">{cmd.disabled ? 'Unavailable' : (cmd.usage ? 'Tab' : 'Enter')}</span>
                             </button>
                           );
@@ -12356,7 +12463,7 @@ function App() {
       </div>
 
       {/* Modals */}
-      {showSettings && <SettingsModal config={config} onSave={setConfig} onClose={() => setShowSettings(false)} mcpToolCount={mcpTools.length} />}
+      {showSettings && <SettingsModal config={config} onSave={setConfig} onClose={() => setShowSettings(false)} mcpToolCount={mcpTools.length} hideBgImage={hideBgImage} setHideBgImage={setHideBgImage} />}
       {lightboxSrc && <Lightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />}
       {showMCPBrowser && <MCPBrowserModal tools={mcpTools} webExtractInfo={webExtractInfo} onClose={() => setShowMCPBrowser(false)} />}
       {showShortcuts && <ShortcutsModal onClose={function(){ setShowShortcuts(false); }} />}

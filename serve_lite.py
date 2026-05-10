@@ -335,6 +335,52 @@ _PROVIDER_DISPLAY = {
     "qwen-oauth": "Qwen OAuth",
 }
 
+_PROVIDER_MODELS = {
+    "anthropic": [
+        {"id": "claude-opus-4-6",            "label": "Claude Opus 4.6"},
+        {"id": "claude-sonnet-4-6",          "label": "Claude Sonnet 4.6"},
+        {"id": "claude-haiku-4-5-20251001",  "label": "Claude Haiku 4.5"},
+    ],
+    "openai": [
+        {"id": "gpt-4.1",      "label": "GPT-4.1"},
+        {"id": "gpt-4.1-mini", "label": "GPT-4.1 Mini"},
+        {"id": "gpt-4.1-nano", "label": "GPT-4.1 Nano"},
+        {"id": "o3",           "label": "o3"},
+        {"id": "o4-mini",      "label": "o4 Mini"},
+    ],
+    "google": [
+        {"id": "gemini-2.5-pro",   "label": "Gemini 2.5 Pro"},
+        {"id": "gemini-2.5-flash", "label": "Gemini 2.5 Flash"},
+    ],
+    "gemini": [
+        {"id": "gemini-2.5-pro",   "label": "Gemini 2.5 Pro"},
+        {"id": "gemini-2.5-flash", "label": "Gemini 2.5 Flash"},
+    ],
+    "deepseek": [
+        {"id": "deepseek-chat",     "label": "DeepSeek Chat"},
+        {"id": "deepseek-reasoner", "label": "DeepSeek Reasoner"},
+    ],
+    "x-ai": [
+        {"id": "grok-3",      "label": "Grok 3"},
+        {"id": "grok-3-mini", "label": "Grok 3 Mini"},
+    ],
+    "minimax": [
+        {"id": "MiniMax-M1",  "label": "MiniMax M1"},
+        {"id": "MiniMax-M2.7","label": "MiniMax M2.7"},
+    ],
+    "mistralai": [
+        {"id": "mistral-large-latest", "label": "Mistral Large"},
+        {"id": "codestral-latest",     "label": "Codestral"},
+    ],
+    "openrouter": [
+        {"id": "anthropic/claude-sonnet-4-6", "label": "Claude Sonnet 4.6"},
+        {"id": "openai/gpt-4.1",              "label": "GPT-4.1"},
+        {"id": "google/gemini-2.5-pro",       "label": "Gemini 2.5 Pro"},
+        {"id": "deepseek/deepseek-chat",      "label": "DeepSeek Chat"},
+        {"id": "x-ai/grok-3",                 "label": "Grok 3"},
+    ],
+}
+
 _OAUTH_PROVIDERS = {"nous", "openai-codex", "copilot", "qwen-oauth"}
 
 def _get_ai_agent():
@@ -387,7 +433,7 @@ def _resolve_model_and_credentials(model_override=None):
     return model, provider, base_url, api_key
 
 
-def _configured_model_options(current_model=None):
+def _configured_model_options(current_model=None, provider=None):
     """Return model choices configured for the UI model switcher."""
     raw = (
         os.environ.get("HERMES_UI_MODELS")
@@ -400,6 +446,15 @@ def _configured_model_options(current_model=None):
         value = part.strip()
         if value and value not in items:
             items.append(value)
+    # If no explicit config, add curated models for the active provider
+    if not items and provider:
+        provider_key = str(provider).strip().lower()
+        curated = _PROVIDER_MODELS.get(provider_key, [])
+        for entry in curated:
+            # Support both dict {"id":..., "label":...} and bare string entries
+            m = entry["id"] if isinstance(entry, dict) else entry
+            if m not in items:
+                items.append(m)
     current = str(current_model or "").strip()
     if current and current not in items:
         items.insert(0, current)
@@ -2944,14 +2999,20 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
         """GET /api/models — return model choices for the chat model switcher."""
         try:
             model, provider, _, _ = _resolve_model_and_credentials()
-            options = _configured_model_options(model)
+            options = _configured_model_options(model, provider)
+            # Build label lookup from curated _PROVIDER_MODELS dicts
+            _label_map = {}
+            for entries in _PROVIDER_MODELS.values():
+                for entry in entries:
+                    if isinstance(entry, dict) and "id" in entry and "label" in entry:
+                        _label_map[entry["id"]] = entry["label"]
             self._json({
                 "current": model or "",
                 "provider": provider or "",
                 "models": [
                     {
                         "id": item,
-                        "label": item.split("/")[-1] if "/" in item else item,
+                        "label": _label_map.get(item, item.split("/")[-1] if "/" in item else item),
                         "provider": _infer_model_provider(item, provider),
                         "provider_label": _PROVIDER_DISPLAY.get(_infer_model_provider(item, provider), _infer_model_provider(item, provider) or "Default"),
                         "context_hint": _model_context_hint(item),
