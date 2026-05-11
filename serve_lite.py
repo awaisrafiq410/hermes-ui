@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import importlib.util
 import json
+import calendar
 import os
 import signal
 import shlex
@@ -1435,6 +1436,128 @@ def _convert_backend_messages_to_ui(backend_msgs):
                 "toolCalls": tcs,
             })
     return ui
+
+
+def _backend_mtime_newer_than_ui(ui_entry, backend_path):
+    """Cheap mtime-vs-last_active_at check to gate the expensive reconcile.
+
+    Returns True when the backend file was modified after the UI entry's
+    last_active_at — i.e. the UI list is missing turns that the agent has
+    already persisted to disk.  Returns True on any parse failure so we
+    err on the side of reconciling.
+    """
+    try:
+        backend_mtime = os.path.getmtime(backend_path)
+    except OSError:
+        return False
+    ui_last = ""
+    if isinstance(ui_entry, dict):
+        ui_last = ui_entry.get("last_active_at") or ""
+    if not ui_last:
+        return True
+    try:
+        # "2026-05-11T14:24:40.000Z" — UTC.
+        parsed = time.strptime(ui_last[:19], "%Y-%m-%dT%H:%M:%S")
+        ui_ts = calendar.timegm(parsed)
+    except Exception:
+        return True
+    return backend_mtime > ui_ts + 1  # 1s slop for round-tripping
+
+
+def _reconcile_ui_entry_with_backend(ui_entry, backend_path):
+    """Append the backend session's newer tail to a UI entry.
+
+    Issue: after a successful agent turn the server saves the assistant
+    reply to the backend session file, but the UI's POST to
+    ``ui-conversations.json`` only fires when the stream completes
+    client-side.  If the user refreshes before that POST lands, the UI
+    entry is stuck with the user prompt and no reply, while the answer
+    sits intact in the backend session file.
+
+    This function detects that drift (cheap mtime check first) and
+    appends the missing tail.  Preserves the UI's rich metadata
+    (reasoning trails, token counts, custom titles, streaming flags) for
+    the earlier portion of the conversation, which the backend file
+    does not retain.
+
+    Strategy: locate the LAST user message in the UI entry, find its
+    corresponding occurrence in the backend (iterating from the end so
+    repeated identical prompts resolve to the most recent match), and
+    convert everything *after* that index into UI-format.  If no match
+    can be found, return the UI entry unchanged rather than risk
+    corrupting the visible transcript.
+    """
+    if not isinstance(ui_entry, dict):
+        return ui_entry
+    if not _backend_mtime_newer_than_ui(ui_entry, backend_path):
+        return ui_entry
+    try:
+        with open(backend_path, "r", encoding="utf-8") as f:
+            backend = json.load(f)
+    except Exception:
+        return ui_entry
+    b_msgs = backend.get("messages") or []
+    if not b_msgs:
+        return ui_entry
+
+    ui_msgs = ui_entry.get("messages") or []
+
+    # Find anchor: last user message in the UI, normalised the same way
+    # _message_identity normalises (strip workspace prefix, collapse
+    # whitespace) so comparison against the backend is tolerant.
+    last_user_text = None
+    for m in reversed(ui_msgs):
+        if isinstance(m, dict) and m.get("role") == "user":
+            t = _message_text(m.get("content"))
+            t = _strip_workspace_prefix(t, include_legacy=True)
+            last_user_text = " ".join((t or "").split())
+            break
+
+    if last_user_text is None:
+        # UI has no user msgs at all — replace with full backend conversion.
+        new_msgs = _convert_backend_messages_to_ui(b_msgs)
+        if not new_msgs:
+            return ui_entry
+    else:
+        cutoff_idx = None
+        for i in range(len(b_msgs) - 1, -1, -1):
+            bm = b_msgs[i]
+            if not isinstance(bm, dict) or bm.get("role") != "user":
+                continue
+            bt = _message_text(bm.get("content"))
+            bt = _strip_workspace_prefix(bt, include_legacy=True)
+            bt_norm = " ".join((bt or "").split())
+            if bt_norm == last_user_text:
+                cutoff_idx = i
+                break
+        if cutoff_idx is None:
+            return ui_entry  # anchor missing — don't risk corrupting
+        tail = b_msgs[cutoff_idx + 1:]
+        if not tail:
+            return ui_entry  # backend has nothing newer
+        tail_ui = _convert_backend_messages_to_ui(tail)
+        if not tail_ui:
+            return ui_entry
+        new_msgs = list(ui_msgs) + tail_ui
+
+    out = dict(ui_entry)
+    out["messages"] = new_msgs
+    out["message_count"] = len(new_msgs)
+    out["user_prompt_count"] = sum(
+        1 for m in new_msgs if isinstance(m, dict) and m.get("role") == "user"
+    )
+    out["tool_call_count"] = sum(
+        len(m.get("toolCalls") or []) for m in new_msgs if isinstance(m, dict)
+    )
+    try:
+        mtime = os.path.getmtime(backend_path)
+        out["last_active_at"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(mtime)
+        )
+    except OSError:
+        pass
+    out["_backend_tail_backfilled"] = True
+    return out
 
 
 def _backend_session_to_ui_entry(session_id, path):
@@ -3442,6 +3565,27 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
         except Exception:
             data = []
 
+        # Pass 1: backfill any entry whose backend session file has newer
+        # turns than the UI's mirror.  This catches the "user refreshed
+        # before the post-stream POST landed and the assistant reply is
+        # missing from the sidebar" case.
+        backfilled = 0
+        for i, entry in enumerate(data):
+            if not isinstance(entry, dict):
+                continue
+            sid = entry.get("id")
+            if not sid:
+                continue
+            path = os.path.join(SESSION_DIR, str(sid) + ".json") if SESSION_DIR else None
+            if not path or not os.path.isfile(path):
+                continue
+            reconciled = _reconcile_ui_entry_with_backend(entry, path)
+            if reconciled is not entry:
+                data[i] = reconciled
+                backfilled += 1
+
+        # Pass 2: fold in any backend session files that aren't in the UI
+        # list at all (true id drift — chats the UI doesn't know about).
         existing_ids = {c.get("id") for c in data if isinstance(c, dict)}
         recovered = 0
         for sid, path in _list_backend_session_files():
@@ -3453,14 +3597,14 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
             data.append(entry)
             recovered += 1
 
-        if recovered:
+        if recovered or backfilled:
             data.sort(
                 key=lambda c: (c.get("last_active_at") or "") if isinstance(c, dict) else "",
                 reverse=True,
             )
             print(
-                f"[serve] /api/ui-conversations: recovered {recovered} chats "
-                f"from backend session files",
+                f"[serve] /api/ui-conversations: recovered={recovered} "
+                f"backfilled={backfilled}",
                 flush=True,
             )
 
@@ -3488,6 +3632,28 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
             except Exception:
                 existing = []
 
+            # Pass A: backfill any incoming entry whose backend file has
+            # newer turns than the UI sent.  Same drift that the GET
+            # handler heals, but applied to writes too — without this,
+            # the UI's stale POST during/after a refresh would rewind
+            # the on-disk list past assistant replies we just persisted.
+            backfilled = 0
+            for i, entry in enumerate(incoming):
+                if not isinstance(entry, dict):
+                    continue
+                sid = entry.get("id")
+                if not sid:
+                    continue
+                path = os.path.join(SESSION_DIR, str(sid) + ".json") if SESSION_DIR else None
+                if not path or not os.path.isfile(path):
+                    continue
+                reconciled = _reconcile_ui_entry_with_backend(entry, path)
+                if reconciled is not entry:
+                    incoming[i] = reconciled
+                    backfilled += 1
+
+            # Pass B: preserve any existing on-disk entry the UI dropped
+            # but whose backend session file still exists.
             incoming_ids = {c.get("id") for c in incoming if isinstance(c, dict)}
             preserved = 0
             for entry in existing:
@@ -3496,29 +3662,23 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
                 sid = entry.get("id")
                 if not sid or sid in incoming_ids:
                     continue
-                # The UI dropped this entry.  Preserve it only if its
-                # backend session file is still on disk — that means the
-                # drop wasn't an intentional deletion, the UI just lost
-                # track of it (state wipe, race condition).  If the
-                # backend file is also gone, treat the drop as a real
-                # deletion and let it stick.
                 if _backend_session_exists(sid):
                     incoming.append(entry)
                     preserved += 1
 
-            if preserved:
+            if preserved or backfilled:
                 incoming.sort(
                     key=lambda c: (c.get("last_active_at") or "") if isinstance(c, dict) else "",
                     reverse=True,
                 )
                 print(
-                    f"[serve] /api/ui-conversations POST: preserved {preserved} "
-                    f"chats with live backend session files",
+                    f"[serve] /api/ui-conversations POST: preserved={preserved} "
+                    f"backfilled={backfilled}",
                     flush=True,
                 )
 
             json.dump(incoming, open(self.CONV_PATH, "w"), indent=2)
-            self._json({"ok": True, "preserved": preserved})
+            self._json({"ok": True, "preserved": preserved, "backfilled": backfilled})
         except Exception as e:
             self._json({"error": str(e)}, 500)
 
