@@ -9830,6 +9830,18 @@ function App() {
           }).catch(function(err) { console.warn('[stream] Auto-approve failed:', err); });
         });
 
+        source.addEventListener('compressing', function(e) {
+          // Context auto-compression is starting. Surface a status indicator
+          // while the summarizer LLM call runs (nesquena-aligned).
+          var d = {};
+          try { d = JSON.parse(e.data); } catch(err) {}
+          if (d.session_id && d.session_id !== activeSessionId) return;
+          var msg = d.message || 'Auto-compressing context...';
+          console.log('[stream] compressing: ' + msg);
+          emitStatus({ kind: 'thinking', label: 'Compressing', detail: msg });
+          if (onThinking) onThinking('[compressing] ' + msg);
+        });
+
         source.addEventListener('compressed', function(e) {
           // Mirrors the reference UI messages.js lines 481-490: context
           // auto-compression notification. When this fires, the backend has
