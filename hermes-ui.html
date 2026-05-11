@@ -9437,9 +9437,45 @@ function App() {
     }
   }, [currentView]);
 
+  // Initial / per-conversation snap-to-bottom (Issue B fix).
+  // Fires when activeConvId is first set OR when the user switches to a
+  // different conversation, but only AFTER messages have hydrated.
+  // Without this the initial page load lands mid-chat: a synthetic
+  // browser scroll event during initial layout flips
+  // autoScrollMessagesRef to false before the [messages] effect can
+  // scroll to the bottom, and the [currentView] effect doesn't fire on
+  // first mount because currentView started as 'chat'.
+  const lastScrolledConvRef = useRef(null);
+  useEffect(function() {
+    if (pendingSearchJumpRef.current) return;
+    if (currentView !== 'chat') return;
+    if (!activeConvId) return;
+    if (!messages || messages.length === 0) return;
+    if (lastScrolledConvRef.current === activeConvId) return;
+    lastScrolledConvRef.current = activeConvId;
+    autoScrollMessagesRef.current = true;
+    setShowJumpToLive(false);
+    // rAF so layout completes before we measure scrollHeight — without
+    // this the scrollIntoView can land at the wrong offset because the
+    // message bubbles haven't reached their final height yet.
+    window.requestAnimationFrame(function() {
+      if (messagesEndRef.current) {
+        messagesEndRef.current.scrollIntoView({ behavior: 'auto' });
+      }
+    });
+  }, [activeConvId, messages.length, currentView]);
+
   const handleMessagesScroll = function() {
     var el = messagesViewportRef.current;
     if (!el) return;
+    // Defense (Issue B): ignore scroll events fired before the
+    // initial snap-to-bottom for this conversation has run.  Without
+    // this, the synthetic scroll event the browser fires during initial
+    // layout reports distance=huge → autoScrollMessagesRef=false, which
+    // then blocks the [messages, isStreaming] effect from ever
+    // scrolling to the bottom on first load.
+    if (!messages || messages.length === 0) return;
+    if (lastScrolledConvRef.current !== activeConvId) return;
     var distance = el.scrollHeight - el.scrollTop - el.clientHeight;
     var pinned = distance < 150;
     autoScrollMessagesRef.current = pinned;
