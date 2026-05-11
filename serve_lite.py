@@ -1027,66 +1027,103 @@ def _messages_have_context_compression_marker(messages):
 
 
 def _context_messages_for_session(session):
-    """Return model-facing history derived from the visible transcript.
+    """Return model-facing history.
 
-    Hermes-ui evolution of this function (this is the third revision; see
-    the design notes below before changing it).
+    This is the fourth revision; the prior three each fixed a real bug
+    while introducing a new one.  Read this before changing it.
 
-    The naive "trust ``context_messages`` if it exists, else fall back to
-    ``messages``" pattern (matching nesquena's ``_session_context_messages``
-    verbatim) DOES NOT work for hermes-ui chats that span multiple agent
-    compactions.  Why: the agent's internal compressor runs once and emits
-    a single compaction marker, and we save that result as
-    ``context_messages``.  When the conversation grows past the agent's
-    context window AGAIN the agent compacts AGAIN — but the save path
-    that produces ``context_messages`` does not reliably carry forward
-    every post-second-compaction turn, while ``messages`` (the display
-    transcript) always does.  Empirically a chat with two compactions
-    can end up with ``messages`` holding both markers + 96 user prompts
-    while ``context_messages`` still only carries the first marker + 34
-    user prompts — and the agent sees the older, lossier view every
-    turn.  Symptom: "I don't have access to list prompts from the
-    transcript … the compaction summary I'm getting is from the very
-    start of the session" on a chat where the user expects the agent to
-    remember an hour of prior work.
+    Design (hybrid: trust the agent's compacted view, backfill display
+    tail it missed).
+
+    The agent's internal compressor runs during ``run_conversation`` and
+    emits a fresh compaction marker + tail.  The save path writes that
+    output to ``context_messages``.  This is the right view to send
+    next turn — small, already summarised, no re-compaction cost.
+
+    BUT: the save path doesn't always run (cancelled streams, errors
+    mid-turn, race with checkpoint), so ``context_messages`` can fall
+    behind ``messages``.  Naively trusting it caused the "agent forgot
+    the last few turns" symptom (see earlier commits).  Naively
+    distrusting it and re-deriving from ``messages`` every turn caused
+    the agent's pre-flight compressor to fire on every single turn
+    (~58s of dead time per request — the "well it didn't do this
+    before the fix" symptom).
 
     Behaviour:
 
-    * Always start from ``messages`` (the canonical visible transcript).
-    * If the transcript contains one or more compaction markers, trim
-      everything before the *most recent* marker — the marker summarises
-      the prior turns so we don't want both the originals and the
-      summary in the prompt.  Older markers are dropped because the
-      latest one already covers what they covered (and earlier).
-    * If the transcript has no markers, return it whole.  The agent's
-      own pre-flight compressor will run on entry if the context is
-      oversized; that's the correct compaction point, not us trying to
-      pre-decide.
+    1. If ``context_messages`` is empty/missing, return ``messages``
+       trimmed from the most recent compaction marker (if any).  This
+       handles the no-saved-context case without re-running the
+       agent's compressor against the full visible transcript.
 
-    ``context_messages`` is left untouched on the session object — the
-    save path still writes it for backward compatibility with anything
-    that reads it — but it's no longer the authoritative source for the
-    model-facing context.  The save path's value remains: it stores
-    ``_restore_reasoning_metadata`` output so reasoning trails survive a
-    round-trip; we just don't trust it for completeness anymore.
+    2. If ``context_messages`` has content, find its last message in
+       ``messages`` (anchor-match via ``_message_identity`` so workspace
+       prefixes / whitespace differences don't matter).  Append
+       everything in ``messages`` after that anchor.  This gives the
+       agent its previously-compacted view PLUS any turns that landed
+       in ``messages`` but missed the ``context_messages`` save.
+
+    3. If the anchor can't be located, trust ``context_messages``
+       as-is rather than risk corrupting the visible transcript.
+
+    Marker detection (``_is_context_compression_marker``) is intentionally
+    strict (role=user, content starts with ``[CONTEXT COMPACTION`` or
+    legacy ``[CONTEXT COMPRESSION``) so tool results that happen to
+    mention compaction can't trigger a false-positive trim.
     """
     if not isinstance(session, dict):
         return []
     display_messages = session.get("messages") or []
-    if not display_messages:
-        return []
+    context_messages = session.get("context_messages")
 
-    # Find the most recent compaction marker, if any.  Iterate from the
-    # end so multiple markers resolve to the latest.
-    last_compaction_idx = -1
-    for idx in range(len(display_messages) - 1, -1, -1):
-        if _is_context_compression_marker(display_messages[idx]):
-            last_compaction_idx = idx
+    # Case 1: no saved context — fall back to display, trimmed from the
+    # latest marker so the agent isn't fed both the originals and the
+    # summary that already covers them.
+    if not isinstance(context_messages, list) or not context_messages:
+        last_marker = -1
+        for idx in range(len(display_messages) - 1, -1, -1):
+            if _is_context_compression_marker(display_messages[idx]):
+                last_marker = idx
+                break
+        if last_marker >= 0:
+            return display_messages[last_marker:]
+        return list(display_messages)
+
+    if not display_messages:
+        return list(context_messages)
+
+    # Case 2: context_messages exists.  Locate its last message in
+    # display to find where the saved context stopped, then append
+    # anything newer.  Scan display from the end for performance and to
+    # resolve duplicates to the most recent occurrence.
+    tail_msg = None
+    for m in reversed(context_messages):
+        if isinstance(m, dict):
+            tail_msg = m
+            break
+    if tail_msg is None:
+        return list(context_messages)
+    tail_key = _message_identity(tail_msg)
+    if tail_key is None:
+        return list(context_messages)
+
+    anchor_idx = None
+    for di in range(len(display_messages) - 1, -1, -1):
+        if _message_identity(display_messages[di]) == tail_key:
+            anchor_idx = di
             break
 
-    if last_compaction_idx >= 0:
-        return display_messages[last_compaction_idx:]
-    return display_messages
+    # Case 3: anchor missing — trust context as-is.  This can happen
+    # right after a recovery / migration where display was rebuilt and
+    # the exact match was lost; trimming context to "just display" would
+    # discard real history, so we prefer the saved compacted view.
+    if anchor_idx is None:
+        return list(context_messages)
+
+    new_tail = display_messages[anchor_idx + 1:]
+    if not new_tail:
+        return list(context_messages)
+    return list(context_messages) + list(new_tail)
 
 
 def _find_current_user_turn(messages, msg_text):
