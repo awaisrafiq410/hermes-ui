@@ -1012,26 +1012,50 @@ def _messages_have_context_compression_marker(messages):
 
 
 def _context_messages_for_session(session):
-    """Return model-facing history, matching the nesquena reference pattern.
+    """Return model-facing history.
 
-    Nesquena maintains ``context_messages`` separately from ``messages``:
-    - ``context_messages``: compacted model-facing context (set after each run)
-    - ``messages``: full visible transcript (UI display)
+    Mirrors nesquena's ``_session_context_messages`` (read ``context_messages``
+    if present, else fall back to ``messages``) with two hermes-ui-specific
+    safety nets layered on top — both motivated by historical bugs where the
+    server wrote a partial / missing ``context_messages`` (cancelled or
+    aborted runs, schema migrations, the agent's own compaction not flowing
+    back through our save path).
 
-    When ``context_messages`` exists and is non-empty, use it (the model's
-    authoritative context).  Otherwise fall back to ``messages`` but — if the
-    transcript contains a compaction marker — trim pre-compaction messages that
-    the marker already summarises so the model doesn't see both the summary AND
-    the original messages it replaced.
+    Safety net 1 (stale ``context_messages``): if the saved context has fewer
+    user turns than the visible transcript AND neither side contains a
+    compaction marker, the context is partial-but-not-compressed — trust the
+    visible transcript instead. (This is the heuristic that commit 2cec0c5
+    removed; removing it caused the short-chat "forgot the first message"
+    regression because turn-1 left ``context_messages`` empty and a blind
+    trust-context read fed the agent an empty history on turn 2.)
+
+    Safety net 2 (rebuild from compaction marker when ``context_messages``
+    is missing entirely): if there's a marker in the transcript, the
+    pre-marker messages were already summarised — return only marker + tail
+    so the model doesn't see both the summary and the originals.
     """
     if not isinstance(session, dict):
         return []
     display_messages = session.get("messages") or []
     context_messages = session.get("context_messages")
     if isinstance(context_messages, list) and context_messages:
+        display_users = _count_role_messages(display_messages, "user")
+        context_users = _count_role_messages(context_messages, "user")
+        has_compaction = (
+            _messages_have_context_compression_marker(context_messages)
+            or _messages_have_context_compression_marker(display_messages)
+        )
+        if (
+            display_users
+            and context_users < display_users
+            and not has_compaction
+        ):
+            # Stale / partial context_messages with no legitimate compression
+            # to explain the drift — prefer the full visible transcript.
+            return display_messages
         return context_messages
 
-    # No context_messages saved — rebuild from the visible transcript.
+    # No context_messages saved at all — fall back to the transcript.
     # If there's a compaction marker in messages, the pre-compaction messages
     # were already summarised.  Use only the marker + everything after it
     # so the model doesn't get the raw originals AND the summary.
@@ -1428,9 +1452,16 @@ CANCEL_FLAGS = {}   # stream_id -> threading.Event
 # Reuse AIAgent instances across turns in the same session. This avoids
 # re-initialising MCP discovery, tool registration, and model resolution
 # on every single message — the primary cause of multi-second startup
-# latency per turn.  Keyed by (session_id, model_signature).
-SESSION_AGENT_CACHE = {}  # (session_id, sig) -> agent instance
+# latency per turn.  Keyed by session_id, value is (agent, signature) so
+# a model/toolset swap on the same session replaces the entry instead of
+# accumulating two entries.  OrderedDict + LRU eviction caps memory; each
+# cached agent retains MCP connections and SessionDB handles, so an
+# unbounded dict would slowly exhaust file descriptors on a long-running
+# server.  Matches the reference UI ``api/config.py``.
+import collections as _collections
+SESSION_AGENT_CACHE = _collections.OrderedDict()  # session_id -> (agent, sig)
 SESSION_AGENT_CACHE_LOCK = threading.Lock()
+SESSION_AGENT_CACHE_MAX = 50  # parallels nesquena's SESSION_AGENT_CACHE_MAX
 AGENT_INSTANCES = {} # stream_id -> agent instance (for cancel/interrupt)
 STREAM_PARTIAL_TEXT = {}  # stream_id -> str, accumulated tokens for cancel-preserve (reference #893)
 STREAM_SESSIONS = {}  # stream_id -> session_id, so cancel_stream can persist partial content
@@ -2088,17 +2119,34 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
             )
 
         # ── Agent cache: reuse across turns in the same session ──
-        # Mirrors nesquena's SESSION_AGENT_CACHE. Avoids re-initializing MCP
-        # discovery, tool registration, model resolution on every turn.
+        # Mirrors nesquena's SESSION_AGENT_CACHE (api/streaming.py).  Avoids
+        # re-initialising MCP discovery, tool registration and model
+        # resolution on every turn.  Three correctness details over the
+        # naive "dict of agents":
+        #   1. Keyed by session_id (single entry per session) with the model
+        #      signature stored alongside so a profile/model swap REPLACES
+        #      the entry instead of leaking another agent.
+        #   2. LRU OrderedDict with eviction at SESSION_AGENT_CACHE_MAX so
+        #      long-running servers don't accumulate dead agents (each one
+        #      holds MCP sockets / SessionDB handles).
+        #   3. Reset transient agent state (_interrupted, _api_call_count)
+        #      on reuse — without this, an agent that was interrupted on a
+        #      prior cancel still believes it is interrupted on the next
+        #      turn.  Same fix nesquena ships in api/streaming.py.
         import hashlib as _hashlib
         _cache_sig = _hashlib.sha256(
-            f"{model}|{provider}|{base_url}|{','.join(toolsets)}".encode()
+            f"{model}|{provider}|{base_url}|{','.join(sorted(toolsets or []))}".encode()
         ).hexdigest()[:16]
-        _cache_key = (session_id, _cache_sig)
+        agent = None
         with SESSION_AGENT_CACHE_LOCK:
-            agent = SESSION_AGENT_CACHE.get(_cache_key)
+            _cached = SESSION_AGENT_CACHE.get(session_id)
+            if _cached and _cached[1] == _cache_sig:
+                agent = _cached[0]
+                SESSION_AGENT_CACHE.move_to_end(session_id)
         if agent is not None:
-            # Update mutable callbacks on the cached agent
+            # Refresh per-turn callbacks (they close over request-scoped
+            # objects: the put queue, cancel_event, on_token capturing this
+            # stream's state).  Mirrors nesquena's reuse branch.
             agent.stream_delta_callback = on_token
             agent.reasoning_callback = on_reasoning
             agent.tool_progress_callback = on_tool
@@ -2106,11 +2154,37 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
                 agent.step_callback = on_step
             if hasattr(agent, 'status_callback'):
                 agent.status_callback = _agent_status_callback
+            # Reset interrupt state so a prior cancel doesn't haunt the
+            # reused agent (nesquena ships the same guard).
+            if hasattr(agent, '_interrupted'):
+                agent._interrupted = False
+            if hasattr(agent, '_interrupt_message'):
+                agent._interrupt_message = None
+            if hasattr(agent, '_api_call_count'):
+                agent._api_call_count = 0
             print(f"[serve] reusing cached agent for {session_id}", flush=True)
         else:
             agent = AgentClass(**_agent_kwargs)
             with SESSION_AGENT_CACHE_LOCK:
-                SESSION_AGENT_CACHE[_cache_key] = agent
+                SESSION_AGENT_CACHE[session_id] = (agent, _cache_sig)
+                SESSION_AGENT_CACHE.move_to_end(session_id)
+                # Bounded LRU eviction.  When over capacity, drop the
+                # oldest entry; without this the cache leaks one agent per
+                # never-revisited session for the life of the server.
+                while len(SESSION_AGENT_CACHE) > SESSION_AGENT_CACHE_MAX:
+                    _evicted_sid, _evicted_entry = SESSION_AGENT_CACHE.popitem(last=False)
+                    _evicted_agent = _evicted_entry[0] if isinstance(_evicted_entry, tuple) else None
+                    # Best-effort close of any SessionDB the evicted agent
+                    # is holding open, otherwise its WAL FD won't be
+                    # released until GC finalises the agent — which on a
+                    # long-lived server may be never.
+                    try:
+                        _ev_db = getattr(_evicted_agent, '_session_db', None)
+                        if _ev_db is not None and hasattr(_ev_db, 'close'):
+                            _ev_db.close()
+                    except Exception:
+                        pass
+                    print(f"[serve] agent cache evicted {_evicted_sid}", flush=True)
             print(f"[serve] created new agent for {session_id}", flush=True)
 
         # User-configurable base system prompt from Settings → General.
@@ -2223,27 +2297,18 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
         # compaction where Hermes can count old prompts but cannot recall them.
         session = _get_or_create_session(session_id)
         _previous_messages = list(session.get("messages") or [])
+        # Read-only: never mutate session state at read time.  The post-run
+        # save block below is the only legitimate writer of context_messages.
         _session_ctx = _context_messages_for_session(session)
-        # If context_messages was rebuilt from a compaction marker (i.e. it
-        # wasn't saved from a prior run), persist it now so the next turn
-        # doesn't have to rebuild again.
-        _had_ctx = isinstance(session.get("context_messages"), list) and session["context_messages"]
-        if not _had_ctx and _session_ctx != _previous_messages:
-            session["context_messages"] = _session_ctx
-            _save_session(session_id, session)
-            print(
-                f"[serve] {session_id}: rebuilt context_messages from compaction "
-                f"marker ({len(_session_ctx)} msgs, was {len(_previous_messages)})",
-                flush=True,
-            )
         _previous_context_messages = _provider_history_from_transcript(
             _session_ctx,
             user_msg,
         )
+        _had_ctx = isinstance(session.get("context_messages"), list) and session["context_messages"]
         print(
             f"[serve] {session_id}: context={len(_previous_context_messages)} msgs, "
             f"display={len(_previous_messages)} msgs, "
-            f"has_ctx={'yes' if _had_ctx else 'rebuilt'}",
+            f"has_ctx={'yes' if _had_ctx else 'fallback'}",
             flush=True,
         )
         _server_user_count = sum(1 for _m in _previous_messages if _m.get("role") == "user")
@@ -2259,10 +2324,24 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
             _previous_messages = _merge_browser_repair_messages(_previous_messages, messages)
             _previous_context_messages = _provider_history_from_transcript(_previous_messages, user_msg)
         clean_history = list(_previous_context_messages)
-        # Remove the last user message — it goes in user_message param instead
         clean_history = _remove_promise_only_tail(clean_history)
+        # Remove the trailing user message *only* if it is a duplicate of the
+        # current user_msg (i.e. an eager checkpoint of this turn's user
+        # message).  The previous unconditional pop was the root cause of the
+        # "short chat forgot the first message" regression: when turn 1 left
+        # a user message with no assistant reply (interrupt / crash / aborted
+        # run), turn 2's clean_history ended with that prior turn's user
+        # message, the unconditional pop dropped it, and the agent ran with
+        # an empty history — losing all memory of turn 1.
+        # _provider_history_from_transcript already calls
+        # _drop_checkpointed_current_user_from_context with the correct
+        # current_user_msg, so this branch is normally a no-op; keep it as a
+        # belt-and-braces guard against double-appended duplicates.
         if clean_history and clean_history[-1].get("role") == "user":
-            clean_history.pop()
+            _tail_key = _message_identity(clean_history[-1])
+            _current_key = _message_identity({"role": "user", "content": user_msg})
+            if _tail_key is not None and _tail_key == _current_key:
+                clean_history.pop()
 
         # Persist the incoming user message BEFORE run_conversation so a server
         # crash mid-turn doesn't silently drop what the user just typed.
