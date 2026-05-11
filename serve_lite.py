@@ -1012,27 +1012,35 @@ def _messages_have_context_compression_marker(messages):
 
 
 def _context_messages_for_session(session):
-    """Return model-facing history without trusting stale compact context.
+    """Return model-facing history, matching the nesquena reference pattern.
 
-    Older builds could save a tiny ``context_messages`` tail while the full
-    visible transcript stayed intact in ``messages``. If no compression marker
-    exists, that tail is stale projection, not real compression, so rebuild from
-    the full transcript.
+    Nesquena maintains ``context_messages`` separately from ``messages``:
+    - ``context_messages``: compacted model-facing context (set after each run)
+    - ``messages``: full visible transcript (UI display)
+
+    When ``context_messages`` exists and is non-empty, use it (the model's
+    authoritative context).  Otherwise fall back to ``messages`` but — if the
+    transcript contains a compaction marker — trim pre-compaction messages that
+    the marker already summarises so the model doesn't see both the summary AND
+    the original messages it replaced.
     """
     if not isinstance(session, dict):
         return []
     display_messages = session.get("messages") or []
     context_messages = session.get("context_messages")
     if isinstance(context_messages, list) and context_messages:
-        display_users = _count_role_messages(display_messages, "user")
-        context_users = _count_role_messages(context_messages, "user")
-        if (
-            display_users
-            and context_users < display_users
-            and not _messages_have_context_compression_marker(display_messages)
-        ):
-            return display_messages
         return context_messages
+
+    # No context_messages saved — rebuild from the visible transcript.
+    # If there's a compaction marker in messages, the pre-compaction messages
+    # were already summarised.  Use only the marker + everything after it
+    # so the model doesn't get the raw originals AND the summary.
+    last_compaction_idx = -1
+    for idx, msg in enumerate(display_messages):
+        if _is_context_compression_marker(msg):
+            last_compaction_idx = idx
+    if last_compaction_idx >= 0:
+        return display_messages[last_compaction_idx:]
     return display_messages
 
 
