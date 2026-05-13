@@ -3841,8 +3841,61 @@ function compareConversationsByActivity(a, b) {
   return String(b && b.id || '').localeCompare(String(a && a.id || ''));
 }
 
+function conversationMessageStats(messages) {
+  var list = Array.isArray(messages) ? messages : [];
+  return {
+    message_count: list.length,
+    user_prompt_count: list.filter(function(m) { return m && m.role === 'user'; }).length,
+    tool_call_count: list.reduce(function(sum, m) { return sum + (m && m.toolCalls ? m.toolCalls.length : 0); }, 0),
+  };
+}
+
+function mergeDuplicateConversation(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  var aMsgs = Array.isArray(a.messages) ? a.messages : [];
+  var bMsgs = Array.isArray(b.messages) ? b.messages : [];
+  var aStats = conversationMessageStats(aMsgs);
+  var bStats = conversationMessageStats(bMsgs);
+  var bBetter = bStats.user_prompt_count > aStats.user_prompt_count
+    || (bStats.user_prompt_count === aStats.user_prompt_count && bStats.message_count > aStats.message_count)
+    || (bStats.user_prompt_count === aStats.user_prompt_count && bStats.message_count === aStats.message_count && getConversationActivityTime(b) > getConversationActivityTime(a));
+  var primary = Object.assign({}, bBetter ? b : a);
+  var secondary = bBetter ? a : b;
+  ['title', 'created', 'workspace', 'source'].forEach(function(key) {
+    if (!primary[key] && secondary[key]) primary[key] = secondary[key];
+  });
+  primary.pinned = !!(primary.pinned || secondary.pinned);
+  primary.archived = !!(primary.archived || secondary.archived);
+  primary.has_compaction = !!(primary.has_compaction || secondary.has_compaction);
+  primary.unread_count = Math.max(Number(primary.unread_count || 0), Number(secondary.unread_count || 0));
+  primary.input_tokens = Math.max(Number(primary.input_tokens || 0), Number(secondary.input_tokens || 0));
+  primary.output_tokens = Math.max(Number(primary.output_tokens || 0), Number(secondary.output_tokens || 0));
+  if (getConversationActivityTime(secondary) > getConversationActivityTime(primary)) {
+    primary.last_active_at = secondary.last_active_at || secondary.updated_at || primary.last_active_at;
+  }
+  return Object.assign(primary, conversationMessageStats(primary.messages || []));
+}
+
+function dedupeConversations(list) {
+  var out = [];
+  var index = {};
+  (Array.isArray(list) ? list : []).forEach(function(conv) {
+    if (!conv || !conv.id) return;
+    var id = String(conv.id);
+    var normalized = Object.assign({}, conv, { id: id });
+    if (Object.prototype.hasOwnProperty.call(index, id)) {
+      out[index[id]] = mergeDuplicateConversation(out[index[id]], normalized);
+    } else {
+      index[id] = out.length;
+      out.push(normalized);
+    }
+  });
+  return out;
+}
+
 function sortConversationsByActivity(list) {
-  return (Array.isArray(list) ? list : []).slice().sort(compareConversationsByActivity);
+  return dedupeConversations(list).slice().sort(compareConversationsByActivity);
 }
 
 function formatConversationActivity(conv) {
@@ -8589,7 +8642,7 @@ function StatusBar({ connected, conversations, messages, sessionTokens, versionI
         )}
       </div>
       <div className="status-bar-item status-bar-version" style={{opacity:0.5}}>
-        <span>Hermes UI v3.3.13</span>
+        <span>Hermes UI v3.3.14</span>
       </div>
     </div>
   );
@@ -8929,14 +8982,19 @@ function App() {
     catch(e) { return ''; }
   });
   const activeWorkspace = workspaces.find(function(w) { return w.path === activeWorkspacePath; }) || workspaces[0] || { name: 'Default', path: activeWorkspacePath || '' };
-  const setConversations = (val) => {
-    if (typeof val === 'function') {
-      _setConversations(prev => { const next = val(prev); conversationsRef.current = next; return next; });
-    } else {
-      conversationsRef.current = val;
-      _setConversations(val);
-    }
-  };
+	  const setConversations = (val) => {
+	    if (typeof val === 'function') {
+	      _setConversations(prev => {
+	        const next = dedupeConversations(val(prev));
+	        conversationsRef.current = next;
+	        return next;
+	      });
+	    } else {
+	      const next = dedupeConversations(val);
+	      conversationsRef.current = next;
+	      _setConversations(next);
+	    }
+	  };
   const [activeConvId, _setActiveConvId] = useState(() => {
     var saved = null;
     try { saved = localStorage.getItem('hermes-active-session') || null; } catch(e) {}
@@ -12330,7 +12388,7 @@ function App() {
                     {agentInstalledVersion && (
                       <span className="status-bar-item status-bar-version">Hermes Agent v{agentInstalledVersion}</span>
                     )}
-                    <span className="status-bar-item status-bar-version">Hermes UI v3.3.13</span>
+                    <span className="status-bar-item status-bar-version">Hermes UI v3.3.14</span>
                     <a className="composer-chip status-icon-btn" href="https://github.com/pyrate-llama/hermes-ui/issues" target="_blank" rel="noopener noreferrer" title="Open Hermes UI issues on GitHub">
                       <Icon name="message-square" size={12}/>
                     </a>

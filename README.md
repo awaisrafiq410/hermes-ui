@@ -6,7 +6,7 @@ The command center for [Hermes Agent](https://github.com/pyrate-llama/hermes-age
 
 Built as a single-file HTML application with React 18, Hermes UI provides a full-featured chat interface, real-time log streaming, file browsing, memory inspection, and more — all through a lightweight Python proxy server.
 
-![v3.3.13](https://img.shields.io/badge/version-3.3.13-ef4444?style=for-the-badge)
+![v3.3.14](https://img.shields.io/badge/version-3.3.14-ef4444?style=for-the-badge)
 ![Single file HTML](https://img.shields.io/badge/architecture-single_file-44d88a?style=for-the-badge)
 ![React 18](https://img.shields.io/badge/react-18.2-61dafb?style=for-the-badge)
 
@@ -36,6 +36,12 @@ Built as a single-file HTML application with React 18, Hermes UI provides a full
 ![Built-in terminal area with Hermes and Claude Code tabs](screenshots/terminal.png)
 
 ---
+
+## What's new in v3.3.14
+
+**Sidebar stability**
+- **Conversation dedupe** — duplicate sidebar rows now collapse by session id on load, save, and live state updates
+- **Refresh cleanup** — persisted duplicate rows are repaired by the server instead of reappearing after reload
 
 ## What's new in v3.3.13
 

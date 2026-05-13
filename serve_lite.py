@@ -273,7 +273,7 @@ def _set_last_workspace(path):
 # Current hermes-ui release version. Bump on every tagged release so the
 # /api/version endpoint can tell the UI when a newer release is available on
 # GitHub. Keep in sync with the git tag (e.g. "3.3" corresponds to v3.3).
-__version__ = "3.3.13"
+__version__ = "3.3.14"
 _GITHUB_RELEASES_API = "https://api.github.com/repos/pyrate-llama/hermes-ui/releases/latest"
 _HERMES_AGENT_RELEASES_API = "https://api.github.com/repos/NousResearch/hermes-agent/releases/latest"
 
@@ -1815,6 +1815,81 @@ def _backend_session_to_ui_entry(session_id, path):
         ),
         "_recovered_from_backend": True,
     }
+
+
+def _ui_conversation_activity_ts(entry):
+    if not isinstance(entry, dict):
+        return 0
+    raw = entry.get("last_active_at") or entry.get("updated_at") or entry.get("created") or ""
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if not raw:
+        return 0
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%m/%d/%Y, %I:%M:%S %p"):
+        try:
+            return calendar.timegm(time.strptime(str(raw)[:19], fmt)) if fmt.startswith("%Y") else time.mktime(time.strptime(str(raw), fmt))
+        except Exception:
+            pass
+    return 0
+
+
+def _ui_conversation_message_stats(messages):
+    messages = messages if isinstance(messages, list) else []
+    return {
+        "message_count": len(messages),
+        "user_prompt_count": sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "user"),
+        "tool_call_count": sum(len(m.get("toolCalls") or []) for m in messages if isinstance(m, dict)),
+    }
+
+
+def _better_ui_conversation_entry(a, b):
+    """Merge two sidebar entries with the same id, preferring fuller content."""
+    if not isinstance(a, dict):
+        return b
+    if not isinstance(b, dict):
+        return a
+    a_msgs = a.get("messages") if isinstance(a.get("messages"), list) else []
+    b_msgs = b.get("messages") if isinstance(b.get("messages"), list) else []
+    a_users = sum(1 for m in a_msgs if isinstance(m, dict) and m.get("role") == "user")
+    b_users = sum(1 for m in b_msgs if isinstance(m, dict) and m.get("role") == "user")
+    if (b_users, len(b_msgs), _ui_conversation_activity_ts(b)) > (a_users, len(a_msgs), _ui_conversation_activity_ts(a)):
+        primary, secondary = dict(b), a
+    else:
+        primary, secondary = dict(a), b
+
+    for key in ("title", "created", "workspace", "source"):
+        if not primary.get(key) and secondary.get(key):
+            primary[key] = secondary.get(key)
+    for key in ("pinned", "archived", "has_compaction"):
+        primary[key] = bool(primary.get(key) or secondary.get(key))
+    primary["unread_count"] = max(int(primary.get("unread_count") or 0), int(secondary.get("unread_count") or 0))
+    primary["input_tokens"] = max(int(primary.get("input_tokens") or 0), int(secondary.get("input_tokens") or 0))
+    primary["output_tokens"] = max(int(primary.get("output_tokens") or 0), int(secondary.get("output_tokens") or 0))
+    if _ui_conversation_activity_ts(secondary) > _ui_conversation_activity_ts(primary):
+        primary["last_active_at"] = secondary.get("last_active_at") or secondary.get("updated_at") or primary.get("last_active_at")
+    primary.update(_ui_conversation_message_stats(primary.get("messages") or []))
+    return primary
+
+
+def _dedupe_ui_conversations(entries):
+    """Collapse duplicate sidebar rows by id before load/save/persist."""
+    out = []
+    index = {}
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        sid = str(entry.get("id") or "").strip()
+        if not sid:
+            continue
+        entry = dict(entry)
+        entry["id"] = sid
+        if sid in index:
+            out[index[sid]] = _better_ui_conversation_entry(out[index[sid]], entry)
+        else:
+            index[sid] = len(out)
+            out.append(entry)
+    out.sort(key=_ui_conversation_activity_ts, reverse=True)
+    return out
 
 
 def _load_ui_conversation_messages(session_id):
@@ -3768,6 +3843,9 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
                 data = []
         except Exception:
             data = []
+        before_dedupe = len(data)
+        data = _dedupe_ui_conversations(data)
+        deduped = before_dedupe - len(data)
 
         # Pass 1: backfill any entry whose backend session file has newer
         # turns than the UI's mirror.  This catches the "user refreshed
@@ -3801,16 +3879,23 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
             data.append(entry)
             recovered += 1
 
-        if recovered or backfilled:
+        if recovered:
+            data = _dedupe_ui_conversations(data)
+
+        if recovered or backfilled or deduped:
             data.sort(
                 key=lambda c: (c.get("last_active_at") or "") if isinstance(c, dict) else "",
                 reverse=True,
             )
             print(
                 f"[serve] /api/ui-conversations: recovered={recovered} "
-                f"backfilled={backfilled}",
+                f"backfilled={backfilled} deduped={deduped}",
                 flush=True,
             )
+            try:
+                json.dump(data, open(self.CONV_PATH, "w"), indent=2)
+            except Exception as e:
+                print(f"[serve] /api/ui-conversations dedupe persist failed: {e}", flush=True)
 
         self._json(data)
 
@@ -3835,6 +3920,10 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
                     existing = []
             except Exception:
                 existing = []
+            incoming_before_dedupe = len(incoming)
+            incoming = _dedupe_ui_conversations(incoming)
+            incoming_deduped = incoming_before_dedupe - len(incoming)
+            existing = _dedupe_ui_conversations(existing)
 
             # Pass A: backfill any incoming entry whose backend file has
             # newer turns than the UI sent.  Same drift that the GET
@@ -3870,19 +3959,22 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
                     incoming.append(entry)
                     preserved += 1
 
-            if preserved or backfilled:
+            if preserved:
+                incoming = _dedupe_ui_conversations(incoming)
+
+            if preserved or backfilled or incoming_deduped:
                 incoming.sort(
                     key=lambda c: (c.get("last_active_at") or "") if isinstance(c, dict) else "",
                     reverse=True,
                 )
                 print(
                     f"[serve] /api/ui-conversations POST: preserved={preserved} "
-                    f"backfilled={backfilled}",
+                    f"backfilled={backfilled} deduped={incoming_deduped}",
                     flush=True,
                 )
 
             json.dump(incoming, open(self.CONV_PATH, "w"), indent=2)
-            self._json({"ok": True, "preserved": preserved, "backfilled": backfilled})
+            self._json({"ok": True, "preserved": preserved, "backfilled": backfilled, "deduped": incoming_deduped})
         except Exception as e:
             self._json({"error": str(e)}, 500)
 
