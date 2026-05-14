@@ -273,7 +273,7 @@ def _set_last_workspace(path):
 # Current hermes-ui release version. Bump on every tagged release so the
 # /api/version endpoint can tell the UI when a newer release is available on
 # GitHub. Keep in sync with the git tag (e.g. "3.3" corresponds to v3.3).
-__version__ = "3.3.15"
+__version__ = "3.3.16"
 _GITHUB_RELEASES_API = "https://api.github.com/repos/pyrate-llama/hermes-ui/releases/latest"
 _HERMES_AGENT_RELEASES_API = "https://api.github.com/repos/NousResearch/hermes-agent/releases/latest"
 
@@ -3386,6 +3386,8 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store, max-age=0")
+        self.send_header("Pragma", "no-cache")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
