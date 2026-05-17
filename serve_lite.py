@@ -1723,27 +1723,32 @@ def _backend_mtime_newer_than_ui(ui_entry, backend_path):
 
 
 def _reconcile_ui_entry_with_backend(ui_entry, backend_path):
-    """Append the backend session's newer tail to a UI entry.
+    """Repair a UI sidebar entry against the canonical backend session file.
 
-    Issue: after a successful agent turn the server saves the assistant
-    reply to the backend session file, but the UI's POST to
-    ``ui-conversations.json`` only fires when the stream completes
-    client-side.  If the user refreshes before that POST lands, the UI
-    entry is stuck with the user prompt and no reply, while the answer
-    sits intact in the backend session file.
+    Two failure modes this handles:
 
-    This function detects that drift (cheap mtime check first) and
-    appends the missing tail.  Preserves the UI's rich metadata
-    (reasoning trails, token counts, custom titles, streaming flags) for
-    the earlier portion of the conversation, which the backend file
-    does not retain.
+      A. Tail drift — backend has newer turns than the UI list.  This
+         happens when the UI never POSTed after the last stream
+         completed (page refresh during/right after the assistant
+         reply).  Fix: anchor on the last user message common to both,
+         append the backend's tail in UI format.  Preserves the UI's
+         rich metadata (reasoning trails, token counts, custom titles,
+         streaming flags) for the earlier portion of the chat.
 
-    Strategy: locate the LAST user message in the UI entry, find its
-    corresponding occurrence in the backend (iterating from the end so
-    repeated identical prompts resolve to the most recent match), and
-    convert everything *after* that index into UI-format.  If no match
-    can be found, return the UI entry unchanged rather than risk
-    corrupting the visible transcript.
+      B. Middle gap — backend has substantially more user prompts than
+         the UI list, but the UI's tail matches the backend's tail.
+         Empirically observed: the UI collapses a compaction event
+         into a single "compaction" card and POSTs a list that omits
+         the pre-compaction messages, even though they're intact on
+         disk.  Anchor-match would find the tail but miss the dropped
+         middle entirely.  Fix: full-rebuild the entry from backend.
+         Loses UI-only metadata (reasoning trails, exact creation
+         dates) but recovers the actual conversation content, which
+         is the priority.
+
+    Strategy: cheap mtime gate → tail backfill → middle-gap check →
+    full rebuild fallback.  Each step exits early if no drift is
+    detected, so healthy entries are returned unchanged.
     """
     if not isinstance(ui_entry, dict):
         return ui_entry
@@ -1758,6 +1763,10 @@ def _reconcile_ui_entry_with_backend(ui_entry, backend_path):
     if not b_msgs:
         return ui_entry
 
+    backend_user_count = sum(
+        1 for m in b_msgs if isinstance(m, dict) and m.get("role") == "user"
+    )
+
     ui_msgs = ui_entry.get("messages") or []
 
     # Find anchor: last user message in the UI, normalised the same way
@@ -1771,11 +1780,12 @@ def _reconcile_ui_entry_with_backend(ui_entry, backend_path):
             last_user_text = " ".join((t or "").split())
             break
 
+    full_rebuild_reason = None
+
     if last_user_text is None:
-        # UI has no user msgs at all — replace with full backend conversion.
+        # UI has no user msgs at all — full rebuild.
+        full_rebuild_reason = "ui has no user messages"
         new_msgs = _convert_backend_messages_to_ui(b_msgs)
-        if not new_msgs:
-            return ui_entry
     else:
         cutoff_idx = None
         for i in range(len(b_msgs) - 1, -1, -1):
@@ -1788,15 +1798,43 @@ def _reconcile_ui_entry_with_backend(ui_entry, backend_path):
             if bt_norm == last_user_text:
                 cutoff_idx = i
                 break
+
         if cutoff_idx is None:
-            return ui_entry  # anchor missing — don't risk corrupting
-        tail = b_msgs[cutoff_idx + 1:]
-        if not tail:
-            return ui_entry  # backend has nothing newer
-        tail_ui = _convert_backend_messages_to_ui(tail)
-        if not tail_ui:
+            # Anchor missing — don't risk corrupting.  This can happen
+            # right after a recovery or a backend rebuild.
             return ui_entry
-        new_msgs = list(ui_msgs) + tail_ui
+
+        tail = b_msgs[cutoff_idx + 1:]
+        tail_ui = _convert_backend_messages_to_ui(tail) if tail else []
+        candidate_msgs = list(ui_msgs) + tail_ui
+
+        # Middle-gap detection: after tail backfill, does the UI still
+        # have far fewer user prompts than the backend?  Tail-backfill
+        # only catches drift at the END of the conversation; if the UI
+        # has been chopped in the MIDDLE (compaction-card collapse,
+        # truncated POST during recovery, etc.) the user counts won't
+        # match even after a successful anchor match.  Allow 2-msg
+        # slop for in-flight turns.
+        candidate_user_count = sum(
+            1 for m in candidate_msgs
+            if isinstance(m, dict) and m.get("role") == "user"
+        )
+        if backend_user_count > candidate_user_count + 2:
+            full_rebuild_reason = (
+                f"middle gap detected: backend has {backend_user_count} "
+                f"user prompts vs candidate {candidate_user_count} "
+                f"(anchor-match alone would leave the chat short by "
+                f"{backend_user_count - candidate_user_count} prompts)"
+            )
+            new_msgs = _convert_backend_messages_to_ui(b_msgs)
+        else:
+            if not tail_ui:
+                # No drift — anchor matches, no newer turns to append.
+                return ui_entry
+            new_msgs = candidate_msgs
+
+    if not new_msgs:
+        return ui_entry
 
     out = dict(ui_entry)
     out["messages"] = new_msgs
@@ -1814,7 +1852,16 @@ def _reconcile_ui_entry_with_backend(ui_entry, backend_path):
         )
     except OSError:
         pass
-    out["_backend_tail_backfilled"] = True
+    if full_rebuild_reason:
+        out["_backend_full_rebuilt"] = True
+        sid = ui_entry.get("id") or "?"
+        print(
+            f"[serve] reconcile {sid}: full-rebuild from backend — "
+            f"{full_rebuild_reason}",
+            flush=True,
+        )
+    else:
+        out["_backend_tail_backfilled"] = True
     return out
 
 
