@@ -3928,13 +3928,67 @@ function isCancellationMarkerMessage(message) {
   return text === '*task cancelled.*' || text === 'task cancelled.';
 }
 
+function mergeToolOnlyAssistantRows(messages) {
+  var out = [];
+  var pendingTools = [];
+  function flushPendingTools() {
+    if (!pendingTools.length) return;
+    out.push({
+      id: 'tool-group-' + Date.now() + '-' + out.length,
+      role: 'assistant',
+      content: '',
+      thinking: false,
+      streaming: false,
+      toolCalls: pendingTools,
+    });
+    pendingTools = [];
+  }
+  (messages || []).forEach(function(m) {
+    if (!m) return;
+    if (m.role === 'tool') return;
+    var tools = Array.isArray(m.toolCalls) ? m.toolCalls : [];
+    var content = String(m.content || '').trim();
+    if (m.role === 'assistant' && tools.length && !content && !m.streaming && !m.thinking) {
+      pendingTools = pendingTools.concat(tools);
+      return;
+    }
+    if (m.role === 'assistant' && pendingTools.length) {
+      out.push(Object.assign({}, m, { toolCalls: pendingTools.concat(tools) }));
+      pendingTools = [];
+      return;
+    }
+    if (m.role === 'user') flushPendingTools();
+    out.push(m);
+  });
+  flushPendingTools();
+  return out;
+}
+
 function cleanLoadedConversationMessages(messages) {
-  return (messages || []).map(function(m) {
+  var cleaned = (messages || []).map(function(m) {
     if (!m) return null;
+    if (m.role === 'tool') return null;
     if (isCancellationMarkerMessage(m)) return null;
     if (!m.streaming && !m.thinking) return m;
     if (m.thinking && !m.content && !(m.toolCalls || []).length) return null;
     return Object.assign({}, m, { streaming: false, thinking: false });
+  }).filter(Boolean);
+  return mergeToolOnlyAssistantRows(cleaned);
+}
+
+function messagesForServerRepair(messages) {
+  return (Array.isArray(messages) ? messages : []).map(function(m) {
+    if (!m || ['system', 'user', 'assistant', 'tool'].indexOf(m.role) === -1) return null;
+    if ((m.streaming || m.thinking) && !String(m.content || '').trim() && !(m.toolCalls || []).length && !(m.reasoning || []).length) return null;
+    var out = {
+      role: m.role,
+      content: m.content || '',
+    };
+    if (m.tool_calls) out.tool_calls = m.tool_calls;
+    if (m.toolCalls) out.toolCalls = m.toolCalls;
+    if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
+    if (m.name) out.name = m.name;
+    return out;
   }).filter(Boolean);
 }
 
@@ -8677,7 +8731,7 @@ function StatusBar({ connected, conversations, messages, sessionTokens, versionI
         )}
       </div>
       <div className="status-bar-item status-bar-version" style={{opacity:0.5}}>
-        <span>Hermes UI v3.3.16</span>
+        <span>Hermes UI v3.3.17</span>
       </div>
     </div>
   );
@@ -9158,7 +9212,7 @@ function App() {
       });
   }, []);
 
-  // Per-conversation streaming state: Map<sessionId, { abortController, paused }>
+  // Per-conversation streaming state: Map<sessionId, { abortController, paused, streamId, pendingSteers }>
   const streamingMap = useRef({});
   const [streamingSessionIds, setStreamingSessionIds] = useState([]);
   // Derived: is the CURRENT conversation streaming/paused?
@@ -9209,10 +9263,31 @@ function App() {
   // isPaused is now derived from pausedSessionIds (defined later with pause/stop functions)
 
   const startStreaming = (sessionId, abortCtrl) => {
-    streamingMap.current[sessionId] = { abortController: abortCtrl, paused: false, streamId: null };
+    streamingMap.current[sessionId] = { abortController: abortCtrl, paused: false, streamId: null, pendingSteers: [] };
     setStreamingSessionIds(prev => prev.includes(sessionId) ? prev : [...prev, sessionId]);
     setAgentStateForSession(sessionId, { kind: 'thinking', label: 'Thinking', detail: 'Starting turn' });
   };
+  async function submitSteerToStream(sessionId, streamId, text, fromPending) {
+    var r = await fetch(API_BASE + '/api/chat/steer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, stream_id: streamId || '', text: text }),
+    });
+    var data = await r.json().catch(function(){ return {}; });
+    if (!r.ok || !data.ok) {
+      if (data && (data.code === 'unsupported' || data.code === 'not_active')) {
+        addLocalLog('WARN  /steer unavailable (' + data.code + ') — falling back to pause+interject');
+        pauseStreaming();
+        await sendInterjection(text);
+        return false;
+      }
+      throw new Error((data && data.error) || ('HTTP ' + r.status));
+    }
+    addLocalLog('INFO  [steer] ' + (fromPending ? 'sent after stream ready' : 'queued') + ' (' + text.length + ' chars)');
+    setAgentStateForSession(sessionId, { kind: 'steer', label: 'Steer queued', detail: text });
+    showSteerFlash('queued', text);
+    return true;
+  }
   // Attach backend stream_id to the per-session streaming entry so Stop/Pause
   // can call /api/chat/cancel directly (mirrors reference cancelStream() pattern).
   // Without this, cancel relied on the EventSource abort listener firing —
@@ -9222,7 +9297,16 @@ function App() {
   // directly and doesn't depend on the abort listener.
   const attachStreamId = (sessionId, streamId) => {
     var entry = streamingMap.current[sessionId];
-    if (entry) entry.streamId = streamId;
+    if (entry) {
+      entry.streamId = streamId;
+      var pending = Array.isArray(entry.pendingSteers) ? entry.pendingSteers.splice(0) : [];
+      pending.forEach(function(item) {
+        submitSteerToStream(sessionId, streamId, item.text, true).catch(function(e) {
+          console.error('Pending steer failed:', e);
+          addLocalLog('ERROR /steer failed: ' + (e && e.message));
+        });
+      });
+    }
   };
   const stopStreaming = (sessionId) => {
     delete streamingMap.current[sessionId];
@@ -9866,6 +9950,7 @@ function App() {
         body: JSON.stringify({
           session_id: sessionId,
           message: message,
+          messages: messagesForServerRepair(messageHistory || []),
           images: _imgs || [],
           base_system_prompt: opts.baseSystemPrompt || '',
           apply_behavioral_guidelines: !!opts.applyBehavioralGuidelines,
@@ -11468,34 +11553,22 @@ function App() {
     if (!text || !text.trim()) return;
     var sid = activeConvId;
     var entry = sid ? streamingMap.current[sid] : null;
-    if (!entry || !entry.streamId) {
-      // Not streaming — fall back to a normal send so Enter still works.
+    if (!entry) {
       await sendMessage(text);
       return;
     }
-    try {
-      var r = await fetch(API_BASE + '/api/chat/steer', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ stream_id: entry.streamId, text: text }),
-      });
-      var data = await r.json().catch(function(){ return {}; });
-      if (!r.ok || !data.ok) {
-        // Older hermes-agent without .steer(), or stream already finished.
-        // Graceful fallback: treat as the classic "auto-pause + interject"
-        // flow so the user's typed message isn't lost.
-        if (data && (data.code === 'unsupported' || data.code === 'not_active')) {
-          addLocalLog('WARN  /steer unavailable (' + data.code + ') — falling back to pause+interject');
-          pauseStreaming();
-          await sendInterjection(text);
-          return;
-        }
-        throw new Error((data && data.error) || ('HTTP ' + r.status));
-      }
+    if (!entry.streamId) {
+      entry.pendingSteers = entry.pendingSteers || [];
+      entry.pendingSteers.push({ text: text.trim(), queuedAt: Date.now() });
       setInput('');
-      addLocalLog('INFO  [steer] queued (' + text.length + ' chars)');
-      setAgentStateForSession(sid, { kind: 'steer', label: 'Steer queued', detail: text });
+      addLocalLog('INFO  [steer] waiting for stream id (' + text.length + ' chars)');
+      setAgentStateForSession(sid, { kind: 'steer', label: 'Steer pending', detail: text });
       showSteerFlash('queued', text);
+      return;
+    }
+    try {
+      await submitSteerToStream(sid, entry.streamId, text, false);
+      setInput('');
     } catch (e) {
       console.error('Steer failed:', e);
       addLocalLog('ERROR /steer failed: ' + (e && e.message));
@@ -12431,7 +12504,7 @@ function App() {
                     {agentInstalledVersion && (
                       <span className="status-bar-item status-bar-version">Hermes Agent v{agentInstalledVersion}</span>
                     )}
-                    <span className="status-bar-item status-bar-version">Hermes UI v3.3.16</span>
+                    <span className="status-bar-item status-bar-version">Hermes UI v3.3.17</span>
                     <a className="composer-chip status-icon-btn" href="https://github.com/pyrate-llama/hermes-ui/issues" target="_blank" rel="noopener noreferrer" title="Open Hermes UI issues on GitHub">
                       <Icon name="message-square" size={12}/>
                     </a>

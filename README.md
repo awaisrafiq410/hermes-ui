@@ -6,7 +6,7 @@ The command center for [Hermes Agent](https://github.com/pyrate-llama/hermes-age
 
 Built as a single-file HTML application with React 18, Hermes UI provides a full-featured chat interface, real-time log streaming, file browsing, memory inspection, and more — all through a lightweight Python proxy server.
 
-![v3.3.16](https://img.shields.io/badge/version-3.3.16-ef4444?style=for-the-badge)
+![v3.3.17](https://img.shields.io/badge/version-3.3.17-ef4444?style=for-the-badge)
 ![Single file HTML](https://img.shields.io/badge/architecture-single_file-44d88a?style=for-the-badge)
 ![React 18](https://img.shields.io/badge/react-18.2-61dafb?style=for-the-badge)
 
@@ -36,6 +36,13 @@ Built as a single-file HTML application with React 18, Hermes UI provides a full
 ![Built-in terminal area with Hermes and Claude Code tabs](screenshots/terminal.png)
 
 ---
+
+## What's new in v3.3.17
+
+**Context, steer, and reload repair**
+- **Short-chat context repair** — browser/server transcript drift is repaired even when user-turn counts match but assistant/tool context is missing
+- **Reliable live steering** — steers typed while a turn is starting are buffered until the stream is ready, and the server can route steers by active session
+- **Tool-card reload cleanup** — refreshed chats fold persisted tool calls back into the assistant answer instead of rendering separate Hermes-only tool bubbles
 
 ## What's new in v3.3.16
 

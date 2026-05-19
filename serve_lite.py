@@ -273,7 +273,7 @@ def _set_last_workspace(path):
 # Current hermes-ui release version. Bump on every tagged release so the
 # /api/version endpoint can tell the UI when a newer release is available on
 # GitHub. Keep in sync with the git tag (e.g. "3.3" corresponds to v3.3).
-__version__ = "3.3.16"
+__version__ = "3.3.17"
 _GITHUB_RELEASES_API = "https://api.github.com/repos/pyrate-llama/hermes-ui/releases/latest"
 _HERMES_AGENT_RELEASES_API = "https://api.github.com/repos/NousResearch/hermes-agent/releases/latest"
 
@@ -885,6 +885,8 @@ def _sanitize_messages_for_api(messages):
     clean = []
     for msg in messages:
         if not isinstance(msg, dict):
+            continue
+        if msg.get("role") not in ("system", "user", "assistant", "tool"):
             continue
         # Skip persisted error markers — never send them to the LLM as prior
         # context. Matches reference _sanitize_messages_for_api (closes error-loop
@@ -1645,7 +1647,42 @@ def _convert_backend_messages_to_ui(backend_msgs):
             if tcid:
                 tool_results[tcid] = _message_text(m.get("content"))
 
+    def _ui_tool_call(tc):
+        if not isinstance(tc, dict):
+            return None
+        fn = tc.get("function") or {}
+        tool_name = fn.get("name") or tc.get("name") or "tool"
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {"_raw": args}
+        return {
+            "toolName": tool_name,
+            "label": tool_name,
+            "args": args or {},
+            "timestamp": "",
+            "done": True,
+            "result": tool_results.get(tc.get("id")),
+        }
+
+    def _flush_pending_tool_turn():
+        nonlocal pending_tool_calls
+        if not pending_tool_calls:
+            return
+        ui.append({
+            "id": "thinking-" + str(base_ts + len(ui)),
+            "role": "assistant",
+            "content": "",
+            "thinking": False,
+            "streaming": False,
+            "toolCalls": pending_tool_calls,
+        })
+        pending_tool_calls = []
+
     ui = []
+    pending_tool_calls = []
     base_ts = int(time.time() * 1000)
     for i, m in enumerate(backend_msgs or []):
         if not isinstance(m, dict):
@@ -1657,6 +1694,7 @@ def _convert_backend_messages_to_ui(backend_msgs):
             continue
         msg_id = str(base_ts + i)
         if role == "user":
+            _flush_pending_tool_turn()
             ui.append({
                 "id": msg_id,
                 "role": "user",
@@ -1665,34 +1703,26 @@ def _convert_backend_messages_to_ui(backend_msgs):
                 "toolCalls": [],
             })
         elif role == "assistant":
-            tcs = []
-            for tc in (m.get("tool_calls") or []):
-                if not isinstance(tc, dict):
-                    continue
-                fn = tc.get("function") or {}
-                tool_name = fn.get("name") or tc.get("name") or "tool"
-                args = fn.get("arguments")
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except Exception:
-                        args = {"_raw": args}
-                tcs.append({
-                    "toolName": tool_name,
-                    "label": tool_name,
-                    "args": args or {},
-                    "timestamp": "",
-                    "done": True,
-                    "result": tool_results.get(tc.get("id")),
-                })
+            content = _message_text(m.get("content"))
+            tcs = [
+                converted for converted in (_ui_tool_call(tc) for tc in (m.get("tool_calls") or []))
+                if converted
+            ]
+            if tcs and not content.strip():
+                pending_tool_calls.extend(tcs)
+                continue
+            if pending_tool_calls:
+                tcs = pending_tool_calls + tcs
+                pending_tool_calls = []
             ui.append({
                 "id": "thinking-" + msg_id,
                 "role": "assistant",
-                "content": _message_text(m.get("content")),
+                "content": content,
                 "thinking": False,
                 "streaming": False,
                 "toolCalls": tcs,
             })
+    _flush_pending_tool_turn()
     return ui
 
 
@@ -2047,6 +2077,60 @@ def _merge_browser_repair_messages(server_messages, client_messages):
     return _sanitize_messages_for_api(merged)
 
 
+def _tail_identities(messages, limit=6):
+    clean = _sanitize_messages_for_api(messages or [])
+    out = []
+    for msg in clean:
+        ident = _message_identity(msg)
+        if ident is not None:
+            out.append(ident)
+    return out[-max(1, int(limit or 1)):]
+
+
+def _should_repair_from_client_transcript(server_messages, client_messages):
+    """True when the browser transcript contains turns the server lacks.
+
+    The reference UI keeps one authoritative server transcript, but this
+    single-file UI also persists a browser/sidebar mirror. When the mirror is
+    richer, user counts can still match while assistant/tool turns are missing
+    from the backend. That is the short-chat "forgot after a few turns" failure.
+    """
+    server_clean = _sanitize_messages_for_api(server_messages or [])
+    client_clean = _sanitize_messages_for_api(
+        _enrich_messages_with_ui_tool_evidence(client_messages or [])
+    )
+    if not client_clean:
+        return False, ""
+    if not server_clean:
+        return True, "server_empty"
+
+    server_users = _count_role_messages(server_clean, "user")
+    client_users = _count_role_messages(client_clean, "user")
+    if client_users > server_users:
+        return True, f"client_users>{server_users}"
+
+    server_assistants = _count_role_messages(server_clean, "assistant")
+    client_assistants = _count_role_messages(client_clean, "assistant")
+    if client_users >= server_users and client_assistants > server_assistants:
+        return True, f"client_assistants>{server_assistants}"
+
+    if (
+        client_users >= server_users
+        and _messages_have_tool_evidence(client_clean)
+        and not _messages_have_tool_evidence(server_clean)
+    ):
+        return True, "client_tool_evidence"
+
+    if (
+        client_users >= server_users
+        and len(client_clean) > len(server_clean)
+        and _tail_identities(client_clean) != _tail_identities(server_clean)
+    ):
+        return True, "tail_mismatch"
+
+    return False, ""
+
+
 def _assistant_claims_local_work_without_tools(msg):
     """Detect promise-only local work replies that should not steer context."""
     if not isinstance(msg, dict) or msg.get("role") != "assistant":
@@ -2141,6 +2225,8 @@ SESSION_AGENT_CACHE_MAX = 50
 AGENT_INSTANCES = {} # stream_id -> agent instance (for cancel/interrupt)
 STREAM_PARTIAL_TEXT = {}  # stream_id -> str, accumulated tokens for cancel-preserve (reference #893)
 STREAM_SESSIONS = {}  # stream_id -> session_id, so cancel_stream can persist partial content
+SESSION_ACTIVE_STREAMS = {}  # session_id -> active stream_id for /steer lookups
+STREAM_PENDING_STEERS = {}  # stream_id -> [text] accepted before agent construction finishes
 STREAM_STEER_STATE = {}  # stream_id -> {"next_id": int, "pending": [steer_record, ...]}
 WORK_ITEMS = {}  # stream_id -> server-backed live work item for Tasks UI
 WORK_ITEMS_LOCK = threading.Lock()
@@ -2464,7 +2550,11 @@ def _session_health_snapshot(session_id, client_messages=None, repair_from_clien
     warning = ""
 
     if client_clean and client_user_count is not None:
-        if client_user_count > server_user_count:
+        should_repair, repair_reason = _should_repair_from_client_transcript(
+            server_messages,
+            client_clean,
+        )
+        if should_repair:
             if repair_from_client:
                 repaired_messages = _merge_browser_repair_messages(server_messages, client_clean)
                 session["messages"] = repaired_messages
@@ -2475,23 +2565,9 @@ def _session_health_snapshot(session_id, client_messages=None, repair_from_clien
                 context_messages = list(session.get("context_messages") or [])
                 server_user_count = _count_role_messages(server_messages, "user")
                 repaired = True
-                warning = "browser_transcript_repaired"
+                warning = f"browser_transcript_repaired:{repair_reason}"
             else:
-                warning = "browser_ahead_of_server"
-        elif client_has_tool_evidence and not server_has_tool_evidence:
-            if repair_from_client:
-                repaired_messages = _merge_browser_repair_messages(server_messages, client_messages)
-                session["messages"] = repaired_messages
-                session["context_messages"] = _provider_history_from_transcript(repaired_messages)
-                session["recovered_at"] = _utc_now_iso()
-                _save_session(session_id, session)
-                server_messages = list(repaired_messages)
-                context_messages = list(session.get("context_messages") or [])
-                server_user_count = _count_role_messages(server_messages, "user")
-                repaired = True
-                warning = "browser_tool_evidence_repaired"
-            else:
-                warning = "browser_has_tool_evidence_missing_on_server"
+                warning = f"browser_transcript_drift:{repair_reason}"
         elif server_user_count > client_user_count + 1:
             warning = "server_ahead_of_browser"
 
@@ -2873,8 +2949,11 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
             agent.ephemeral_system_prompt = base_system_prompt
 
         # Store agent instance for cancel/interrupt
+        _pending_steer_texts = []
         with STREAMS_LOCK:
             AGENT_INSTANCES[stream_id] = agent
+            SESSION_ACTIVE_STREAMS[session_id] = stream_id
+            _pending_steer_texts = STREAM_PENDING_STEERS.pop(stream_id, [])
             if stream_id in CANCEL_FLAGS and CANCEL_FLAGS[stream_id].is_set():
                 try:
                     agent.interrupt("Cancelled before start")
@@ -2882,6 +2961,16 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
                     pass
                 put("cancel", {"message": "Cancelled by user"})
                 return
+        for _early_steer in _pending_steer_texts:
+            try:
+                agent.steer(_early_steer)
+                print(
+                    f"[serve] /api/chat/steer delivered early steer stream={stream_id[:8]} "
+                    f"len={len(_early_steer)}",
+                    flush=True,
+                )
+            except Exception as _steer_err:
+                print(f"[serve] early steer delivery failed: {_steer_err!r}", flush=True)
 
         # Register approval callback so dangerous tool calls don't hang forever
         # Without this, the agent blocks waiting for approval the UI never shows
@@ -2990,10 +3079,15 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
         ) if _browser_messages else []
         _server_user_count = sum(1 for _m in _previous_messages if _m.get("role") == "user")
         _browser_user_count = _count_role_messages(_browser_clean, "user") if _browser_clean else 0
-        if _browser_clean and _browser_user_count > _server_user_count:
+        _repair_from_browser, _browser_repair_reason = _should_repair_from_client_transcript(
+            _previous_messages,
+            _browser_clean,
+        )
+        if _repair_from_browser:
             print(
-                f"[serve] /api/chat/start browser transcript ahead for {session_id}: "
+                f"[serve] /api/chat/start browser transcript repair for {session_id}: "
                 f"browser_users={_browser_user_count} server_users={_server_user_count}; "
+                f"reason={_browser_repair_reason}; "
                 "repairing before send",
                 flush=True,
             )
@@ -3019,11 +3113,15 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
         )
         _server_user_count = sum(1 for _m in _previous_messages if _m.get("role") == "user")
         _client_user_count = sum(1 for _m in messages if isinstance(_m, dict) and _m.get("role") == "user")
-        _use_client_history = _client_user_count > _server_user_count
+        _use_client_history, _client_repair_reason = _should_repair_from_client_transcript(
+            _previous_messages,
+            messages,
+        )
         if _use_client_history:
             print(
-                f"[serve] /api/chat/start history drift for {session_id}: "
+                f"[serve] /api/chat/start client transcript repair for {session_id}: "
                 f"client_users={_client_user_count} server_users={_server_user_count}; "
+                f"reason={_client_repair_reason}; "
                 "repairing server transcript from frontend",
                 flush=True,
             )
@@ -3327,6 +3425,9 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
             AGENT_INSTANCES.pop(stream_id, None)
             STREAM_PARTIAL_TEXT.pop(stream_id, None)
             STREAM_SESSIONS.pop(stream_id, None)
+            if SESSION_ACTIVE_STREAMS.get(session_id) == stream_id:
+                SESSION_ACTIVE_STREAMS.pop(session_id, None)
+            STREAM_PENDING_STEERS.pop(stream_id, None)
             STREAM_STEER_STATE.pop(stream_id, None)
 
 
@@ -3620,6 +3721,17 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
             if _inline_images:
                 _user_turn["images"] = _inline_images
             messages = [_user_turn]
+        elif messages and _inline_message:
+            # The browser may send its visible transcript as repair context.
+            # Keep the current user turn aligned with `message`, which can
+            # include generated image descriptions or other send-time text that
+            # is not yet reflected in the visible bubble.
+            for _m in reversed(messages):
+                if isinstance(_m, dict) and _m.get("role") == "user":
+                    _m["content"] = _inline_message
+                    if _inline_images:
+                        _m["images"] = _inline_images
+                    break
 
         if not messages:
             return self._json({"error": "No messages provided"}, 400)
@@ -3773,14 +3885,39 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             return self._json({"ok": False, "error": f"bad json: {e}"}, 400)
         stream_id = str(body.get("stream_id") or "").strip()
+        session_id = _resolve_session_id(str(body.get("session_id") or "").strip())
         text = str(body.get("text") or "").strip()
+        if not stream_id and session_id:
+            with STREAMS_LOCK:
+                stream_id = SESSION_ACTIVE_STREAMS.get(session_id, "")
         if not stream_id:
-            return self._json({"ok": False, "error": "stream_id required"}, 400)
+            return self._json({"ok": False, "error": "stream_id or session_id required", "code": "not_active"}, 409)
         if not text:
             return self._json({"ok": False, "error": "text required"}, 400)
+        queued_for_agent = False
         with STREAMS_LOCK:
             agent = AGENT_INSTANCES.get(stream_id)
+            stream_alive = stream_id in STREAMS
+            if agent is None and stream_alive:
+                STREAM_PENDING_STEERS.setdefault(stream_id, []).append(text)
+                queued_for_agent = True
         if agent is None:
+            if queued_for_agent:
+                steer_meta = _queue_stream_steer(stream_id, text)
+                print(
+                    f"[serve] /api/chat/steer stream={stream_id[:8]} accepted=True "
+                    f"pending_agent=True len={len(text)}",
+                    flush=True,
+                )
+                return self._json({
+                    "ok": True,
+                    "accepted": True,
+                    "pending_agent": True,
+                    "steer": {
+                        "id": steer_meta["id"],
+                        "preview": steer_meta["preview"],
+                    },
+                })
             # Stream already finished, or never existed. Frontend should
             # treat as "too late — send as a new message instead".
             return self._json({"ok": False, "error": "stream not active", "code": "not_active"}, 409)
