@@ -273,7 +273,7 @@ def _set_last_workspace(path):
 # Current hermes-ui release version. Bump on every tagged release so the
 # /api/version endpoint can tell the UI when a newer release is available on
 # GitHub. Keep in sync with the git tag (e.g. "3.3" corresponds to v3.3).
-__version__ = "3.3.17"
+__version__ = "3.3.18"
 _GITHUB_RELEASES_API = "https://api.github.com/repos/pyrate-llama/hermes-ui/releases/latest"
 _HERMES_AGENT_RELEASES_API = "https://api.github.com/repos/NousResearch/hermes-agent/releases/latest"
 
@@ -1038,8 +1038,20 @@ def _should_use_full_transcript_context(messages):
     )
 
 
-def _recent_visible_turns_context(messages, limit=14, max_chars=520):
-    """Compact user/assistant turns that may have fallen outside model context."""
+def _recent_visible_turns_context(
+    messages,
+    limit=14,
+    max_chars=520,
+    min_user_turns=5,
+):
+    """Compact UI turns while always preserving the latest user instructions.
+
+    Tool-heavy or crash-recovery turns can create many assistant/status rows
+    after the user's actual steering instruction.  A raw tail window then shows
+    stale assistant chatter but drops the current task.  Keep the normal compact
+    tail, but splice in the last few user turns even when assistant rows would
+    otherwise push them out.
+    """
     turns = []
     for msg in messages or []:
         if not isinstance(msg, dict):
@@ -1069,7 +1081,20 @@ def _recent_visible_turns_context(messages, limit=14, max_chars=520):
         turns.append((role, text))
     if not turns:
         return ""
-    selected = turns[-max(1, int(limit or 1)):]
+    limit = max(1, int(limit or 1))
+    min_user_turns = max(0, int(min_user_turns or 0))
+    selected_by_idx = {}
+    tail_start = max(0, len(turns) - limit)
+    for idx in range(tail_start, len(turns)):
+        selected_by_idx[idx] = turns[idx]
+    if min_user_turns:
+        user_idxs = [
+            idx for idx, (role, _text) in enumerate(turns)
+            if role == "user"
+        ]
+        for idx in user_idxs[-min_user_turns:]:
+            selected_by_idx[idx] = turns[idx]
+    selected = [selected_by_idx[idx] for idx in sorted(selected_by_idx)]
     lines = [
         f"{idx}. {role}: {text}"
         for idx, (role, text) in enumerate(selected, 1)
@@ -3048,7 +3073,9 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
             "Treat those turns as real conversation state. If they show that you "
             "offered to do a concrete action and the user accepted, continue with "
             "that action instead of saying you do not recall it or asking the user "
-            "to confirm again.\n"
+            "to confirm again. Recent user instructions override older transcript "
+            "and memory when they conflict; never resume an older workflow that a "
+            "recent user turn cancelled, abandoned, or replaced.\n"
             "Do not claim new local file/process work is complete unless you actually "
             "used a tool in this turn and observed the result. If the prior transcript "
             "says earlier work was completed but tool metadata is missing, do not "
