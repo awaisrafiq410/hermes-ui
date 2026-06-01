@@ -32,6 +32,7 @@ import uuid
 import traceback
 import urllib.parse
 import mimetypes
+from contextlib import contextmanager
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
 UPLOAD_MAX_BYTES = 750 * 1024 * 1024
@@ -90,7 +91,8 @@ _check_interpreter_matches_venv()
 
 # ── Hermes agent discovery ──────────────────────────────────────────────────
 HERMES_HOME = os.path.expanduser("~/.hermes")
-AGENT_DIR = os.path.join(HERMES_HOME, "hermes-agent")
+DEFAULT_HERMES_HOME = HERMES_HOME
+AGENT_DIR = os.path.join(DEFAULT_HERMES_HOME, "hermes-agent")
 DIR = os.path.dirname(os.path.abspath(__file__))
 PORT = 3333
 WORKSPACES_FILE = pathlib.Path(HERMES_HOME) / "ui-workspaces.json"
@@ -98,6 +100,150 @@ LAST_WORKSPACE_FILE = pathlib.Path(HERMES_HOME) / "ui-last-workspace.txt"
 AUTH_PASSWORD = os.environ.get("HERMES_UI_PASSWORD") or os.environ.get("HERMES_WEBUI_PASSWORD")
 AUTH_COOKIE_NAME = "hermes_ui_auth"
 AUTH_SECRET_FILE = pathlib.Path(HERMES_HOME) / "ui-auth-secret"
+
+def _import_hermes_profiles():
+    try:
+        from hermes_cli import profiles as _profiles
+        return _profiles
+    except Exception as exc:
+        print(f"[serve] WARNING: hermes_cli.profiles unavailable: {exc!r}", flush=True)
+        return None
+
+def _active_hermes_profile():
+    profiles = _import_hermes_profiles()
+    if profiles:
+        try:
+            return str(profiles.get_active_profile() or "default")
+        except Exception as exc:
+            print(f"[serve] WARNING: get_active_profile failed: {exc!r}", flush=True)
+    return "default"
+
+def _profile_home(profile_name=None):
+    name = str(profile_name or _active_hermes_profile() or "default").strip() or "default"
+    profiles = _import_hermes_profiles()
+    if profiles:
+        try:
+            return pathlib.Path(profiles.resolve_profile_env(name)).expanduser(), name
+        except Exception as exc:
+            print(f"[serve] WARNING: resolve_profile_env({name!r}) failed: {exc!r}", flush=True)
+            if name != "default":
+                raise
+    return pathlib.Path(DEFAULT_HERMES_HOME).expanduser(), "default"
+
+def _read_yaml_file(path):
+    try:
+        import yaml
+        p = pathlib.Path(path)
+        if p.exists():
+            return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        print(f"[serve] WARNING: failed to read {path}: {exc}", flush=True)
+    return {}
+
+def _load_profile_env_values(profile_name=None):
+    try:
+        home, _ = _profile_home(profile_name)
+    except Exception:
+        home = pathlib.Path(DEFAULT_HERMES_HOME)
+    env_path = home / ".env"
+    values = {}
+    if not env_path.exists():
+        return values
+    try:
+        for raw in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip().strip('"').strip("'")
+    except Exception:
+        return {}
+    return values
+
+def _apply_active_profile_environment(profile_name=None):
+    """Make this local UI process follow the same active profile as Hermes CLI."""
+    home, name = _profile_home(profile_name)
+    env_values = _load_profile_env_values(name)
+    with _ENV_LOCK:
+        os.environ["HERMES_HOME"] = str(home)
+        for key, value in env_values.items():
+            if key:
+                os.environ[key] = value
+    return str(home), name
+
+@contextmanager
+def _profile_env_context(profile_name=None):
+    """Temporarily expose a profile's HERMES_HOME/.env to Hermes runtime helpers."""
+    home, name = _profile_home(profile_name)
+    env_values = _load_profile_env_values(name)
+    with _ENV_LOCK:
+        old_home = os.environ.get("HERMES_HOME")
+        old_values = {key: os.environ.get(key) for key in env_values}
+        os.environ["HERMES_HOME"] = str(home)
+        for key, value in env_values.items():
+            if key:
+                os.environ[key] = value
+    try:
+        yield str(home), name
+    finally:
+        with _ENV_LOCK:
+            if old_home is None:
+                os.environ.pop("HERMES_HOME", None)
+            else:
+                os.environ["HERMES_HOME"] = old_home
+            for key, value in old_values.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+def _list_hermes_profiles_payload():
+    profiles_mod = _import_hermes_profiles()
+    active = _active_hermes_profile()
+    items = []
+    if profiles_mod:
+        try:
+            for item in profiles_mod.list_profiles():
+                data = {
+                    "name": str(getattr(item, "name", "") or "default"),
+                    "path": str(getattr(item, "path", "") or ""),
+                    "is_default": bool(getattr(item, "is_default", False)),
+                    "is_active": bool(getattr(item, "is_active", False)),
+                    "gateway_running": bool(getattr(item, "gateway_running", False)),
+                    "model": str(getattr(item, "model", "") or ""),
+                    "provider": str(getattr(item, "provider", "") or ""),
+                    "has_env": bool(getattr(item, "has_env", False)),
+                    "skill_count": int(getattr(item, "skill_count", 0) or 0),
+                }
+                if data["name"] == active:
+                    data["is_active"] = True
+                items.append(data)
+        except Exception as exc:
+            print(f"[serve] WARNING: list_profiles failed: {exc!r}", flush=True)
+    if not items:
+        home = pathlib.Path(DEFAULT_HERMES_HOME)
+        cfg = _read_yaml_file(home / "config.yaml")
+        model_cfg = cfg.get("model", {}) if isinstance(cfg.get("model"), dict) else {}
+        items.append({
+            "name": "default",
+            "path": str(home),
+            "is_default": True,
+            "is_active": active == "default",
+            "gateway_running": False,
+            "model": str(model_cfg.get("default") or ""),
+            "provider": str(model_cfg.get("provider") or ""),
+            "has_env": (home / ".env").exists(),
+            "skill_count": 0,
+        })
+        active = "default"
+    active_item = next((p for p in items if p.get("name") == active), items[0])
+    return {
+        "ok": True,
+        "active": active_item.get("name") or active,
+        "profiles": items,
+        "default_model": active_item.get("model") or "",
+        "default_model_provider": active_item.get("provider") or "",
+    }
 
 def _workspace_label(path):
     p = pathlib.Path(path)
@@ -273,7 +419,7 @@ def _set_last_workspace(path):
 # Current hermes-ui release version. Bump on every tagged release so the
 # /api/version endpoint can tell the UI when a newer release is available on
 # GitHub. Keep in sync with the git tag (e.g. "3.3" corresponds to v3.3).
-__version__ = "3.3.18"
+__version__ = "3.3.19"
 _GITHUB_RELEASES_API = "https://api.github.com/repos/pyrate-llama/hermes-ui/releases/latest"
 _HERMES_AGENT_RELEASES_API = "https://api.github.com/repos/NousResearch/hermes-agent/releases/latest"
 
@@ -396,37 +542,37 @@ def _get_ai_agent():
     return _AIAgent
 
 
-def _resolve_model_and_credentials(model_override=None):
+def _resolve_model_and_credentials(model_override=None, profile_name=None):
     """Read model/provider from config.yaml and resolve API credentials."""
-    import yaml
-    config_path = os.path.join(HERMES_HOME, "config.yaml")
+    profile_home, active_profile = _profile_home(profile_name)
+    config_path = profile_home / "config.yaml"
     model = "MiniMax-M2.7"
     provider = None
     base_url = None
 
-    if os.path.exists(config_path):
+    if config_path.exists():
         try:
-            with open(config_path) as f:
-                cfg = yaml.safe_load(f) or {}
+            cfg = _read_yaml_file(config_path)
             model_cfg = cfg.get("model", {})
             model = model_cfg.get("default", model)
             provider = model_cfg.get("provider")
             base_url = model_cfg.get("base_url")
         except Exception as e:
-            print(f"[serve] WARNING: Failed to read config.yaml: {e}", flush=True)
+            print(f"[serve] WARNING: Failed to read config.yaml for profile {active_profile}: {e}", flush=True)
 
     # Use Hermes runtime provider to resolve API key
     api_key = None
-    try:
-        from hermes_cli.runtime_provider import resolve_runtime_provider
-        rt = resolve_runtime_provider(requested=provider)
-        api_key = rt.get("api_key")
-        if not provider:
-            provider = rt.get("provider")
-        if not base_url:
-            base_url = rt.get("base_url")
-    except Exception as e:
-        print(f"[serve] WARNING: resolve_runtime_provider failed: {e}", flush=True)
+    with _profile_env_context(active_profile):
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+            rt = resolve_runtime_provider(requested=provider)
+            api_key = rt.get("api_key")
+            if not provider:
+                provider = rt.get("provider")
+            if not base_url:
+                base_url = rt.get("base_url")
+        except Exception as e:
+            print(f"[serve] WARNING: resolve_runtime_provider failed: {e}", flush=True)
 
     override = str(model_override or "").strip()
     if override:
@@ -615,23 +761,11 @@ def _resolve_delegation_credentials():
     return model, provider, base_url, api_key
 
 def _load_env_values():
-    env_path = pathlib.Path(HERMES_HOME) / ".env"
-    values = {}
-    if not env_path.exists():
-        return values
-    try:
-        for raw in env_path.read_text(encoding="utf-8").splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            values[key.strip()] = value.strip().strip('"').strip("'")
-    except Exception:
-        return {}
-    return values
+    return _load_profile_env_values()
 
 def _write_env_update(env_var, value):
-    env_path = pathlib.Path(HERMES_HOME) / ".env"
+    profile_home, _ = _profile_home()
+    env_path = profile_home / ".env"
     clean = (str(value or "").strip()) or None
     if clean and ("\n" in clean or "\r" in clean):
         raise ValueError("API key must not contain newline characters.")
@@ -677,21 +811,20 @@ def _write_env_update(env_var, value):
         else:
             os.environ.pop(env_var, None)
 
-def _read_provider_config_status():
-    import yaml
-
+def _read_provider_config_status(profile_name=None):
     cfg = {}
-    cfg_path = pathlib.Path(HERMES_HOME) / "config.yaml"
+    try:
+        profile_home, active_profile = _profile_home(profile_name)
+    except Exception:
+        profile_home, active_profile = pathlib.Path(DEFAULT_HERMES_HOME), "default"
+    cfg_path = profile_home / "config.yaml"
     if cfg_path.exists():
-        try:
-            cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
-        except Exception:
-            cfg = {}
+        cfg = _read_yaml_file(cfg_path)
 
     model_cfg = cfg.get("model", {}) if isinstance(cfg.get("model"), dict) else {}
     providers_cfg = cfg.get("providers", {}) if isinstance(cfg.get("providers"), dict) else {}
     active_provider = str(model_cfg.get("provider") or "").strip().lower()
-    env_values = _load_env_values()
+    env_values = _load_profile_env_values(active_profile)
     known = set(_PROVIDER_ENV_VARS) | set(_OAUTH_PROVIDERS) | set(providers_cfg)
     if active_provider:
         known.add(active_provider)
@@ -738,6 +871,7 @@ def _read_provider_config_status():
         "providers": providers,
         "active_provider": active_provider,
         "default_model": model_cfg.get("default", ""),
+        "profile": active_profile,
     }
 
 def _model_capabilities(model, provider=None, agent_ok=False):
@@ -2613,7 +2747,7 @@ def _session_health_snapshot(session_id, client_messages=None, repair_from_clien
     }
 
 
-def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="", reasoning_effort="", workspace=None, model_override=""):
+def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="", reasoning_effort="", workspace=None, model_override="", hermes_profile=""):
     """Run AIAgent in a background thread, pushing SSE events to the queue."""
     q = STREAMS.get(stream_id)
     if q is None:
@@ -2640,10 +2774,17 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
     except Exception as e:
         print(f"[serve] WARNING: invalid workspace {workspace!r}: {e}; using project root", flush=True)
         workspace_dir = str(PROJECT_ROOT.resolve())
+    try:
+        profile_home, active_profile = _profile_home(hermes_profile or None)
+    except Exception as e:
+        put("error", {"message": f"Hermes profile error: {e}"})
+        return
 
     _set_thread_env(
         TERMINAL_CWD=workspace_dir,
         HERMES_SESSION_KEY=session_id,
+        HERMES_HOME=str(profile_home),
+        HERMES_PROFILE=active_profile,
     )
 
     # Save and set process-level env vars under lock
@@ -2651,9 +2792,11 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
         old_cwd = os.environ.get("TERMINAL_CWD")
         old_exec_ask = os.environ.get("HERMES_EXEC_ASK")
         old_session_key = os.environ.get("HERMES_SESSION_KEY")
+        old_hermes_home = os.environ.get("HERMES_HOME")
         os.environ["TERMINAL_CWD"] = workspace_dir
         os.environ.pop("HERMES_EXEC_ASK", None)
         os.environ["HERMES_SESSION_KEY"] = session_id
+        os.environ["HERMES_HOME"] = str(profile_home)
 
     _approval_registered = False
     _unreg_notify = None
@@ -2675,7 +2818,7 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
             put("error", {"message": "AIAgent not available — check hermes-agent installation"})
             return
 
-        model, provider, base_url, api_key = _resolve_model_and_credentials(model_override)
+        model, provider, base_url, api_key = _resolve_model_and_credentials(model_override, active_profile)
         if model_override:
             print(f"[serve] model_override={model}", flush=True)
 
@@ -2697,7 +2840,7 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
             from tools.mcp_tool import discover_mcp_tools
             discover_mcp_tools()  # idempotent; lazy MCP server init
             import yaml
-            cfg_path = os.path.join(HERMES_HOME, "config.yaml")
+            cfg_path = str(profile_home / "config.yaml")
             with open(cfg_path) as f:
                 cfg = yaml.safe_load(f) or {}
             toolsets = list(_get_platform_tools(cfg, "cli"))
@@ -2912,7 +3055,7 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
         #      turn.
         import hashlib as _hashlib
         _cache_sig = _hashlib.sha256(
-            f"{model}|{provider}|{base_url}|{','.join(sorted(toolsets or []))}".encode()
+            f"{active_profile}|{profile_home}|{model}|{provider}|{base_url}|{','.join(sorted(toolsets or []))}".encode()
         ).hexdigest()[:16]
         agent = None
         with SESSION_AGENT_CACHE_LOCK:
@@ -3445,6 +3588,8 @@ def _run_agent_streaming(session_id, messages, stream_id, base_system_prompt="",
             else: os.environ["HERMES_EXEC_ASK"] = old_exec_ask
             if old_session_key is None: os.environ.pop("HERMES_SESSION_KEY", None)
             else: os.environ["HERMES_SESSION_KEY"] = old_session_key
+            if old_hermes_home is None: os.environ.pop("HERMES_HOME", None)
+            else: os.environ["HERMES_HOME"] = old_hermes_home
         _clear_thread_env()
         with STREAMS_LOCK:
             STREAMS.pop(stream_id, None)
@@ -3644,6 +3789,18 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
         messages = body.get("messages", [])
         requested_session_id = body.get("session_id") or self.headers.get("X-Hermes-Session-Id") or f"web_{uuid.uuid4().hex[:12]}"
         session_id = _resolve_session_id(requested_session_id)
+        hermes_profile = str(
+            body.get("hermes_profile")
+            or body.get("runtime_profile")
+            or body.get("hermesProfile")
+            or ""
+        ).strip()
+        try:
+            profile_home, active_profile = _profile_home(hermes_profile or None)
+            if hermes_profile:
+                _apply_active_profile_environment(active_profile)
+        except Exception as e:
+            return self._json({"error": f"Hermes profile error: {e}"}, 400)
         if requested_session_id != session_id:
             print(
                 f"[serve] /api/chat/start resolved session alias: "
@@ -3655,6 +3812,8 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
             _set_last_workspace(workspace)
             session = _get_or_create_session(session_id)
             session["workspace"] = workspace
+            session["hermes_profile"] = active_profile
+            session["hermes_home"] = str(profile_home)
             _save_session(session_id, session)
         except Exception as e:
             return self._json({"error": str(e)}, 400)
@@ -3784,7 +3943,7 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
 
         thr = threading.Thread(
             target=_run_agent_streaming,
-            args=(session_id, messages, stream_id, base_system_prompt, reasoning_effort, workspace, model_override),
+            args=(session_id, messages, stream_id, base_system_prompt, reasoning_effort, workspace, model_override, active_profile),
             daemon=True,
         )
         thr.start()
@@ -4074,6 +4233,33 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
             })
         except Exception as e:
             self._json({"error": str(e)}, 500)
+
+    def _handle_hermes_profiles(self):
+        """GET /api/hermes-profiles — list Hermes runtime profiles without secrets."""
+        try:
+            self._json(_list_hermes_profiles_payload())
+        except Exception as e:
+            self._json({"ok": False, "error": str(e)}, 500)
+
+    def _handle_hermes_profile_switch(self):
+        """POST /api/hermes-profile/switch — mirror `hermes profile use`."""
+        try:
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+            name = str(body.get("name") or body.get("profile") or "").strip()
+            if not name:
+                return self._json({"ok": False, "error": "profile name is required"}, 400)
+            profiles_mod = _import_hermes_profiles()
+            if not profiles_mod:
+                if name != "default":
+                    return self._json({"ok": False, "error": "Hermes profile support is unavailable"}, 400)
+            else:
+                profiles_mod.set_active_profile(name)
+            home, active = _apply_active_profile_environment(name)
+            payload = _list_hermes_profiles_payload()
+            payload.update({"ok": True, "active": active, "home": home})
+            self._json(payload)
+        except Exception as e:
+            self._json({"ok": False, "error": str(e)}, 400)
 
     def _handle_provider_key_save(self):
         try:
@@ -5362,6 +5548,8 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
             self._handle_providers()
         elif self.path == "/api/models":
             self._handle_models()
+        elif self.path == "/api/hermes-profiles" or self.path == "/api/profiles":
+            self._handle_hermes_profiles()
         elif self.path == "/cron/list":
             self._handle_cron_list()
         elif self.path == "/api/delegation/info":
@@ -5438,6 +5626,8 @@ class HermesDirectServer(http.server.SimpleHTTPRequestHandler):
             self._handle_provider_key_save()
         elif self.path == "/api/providers/delete":
             self._handle_provider_key_delete()
+        elif self.path == "/api/hermes-profile/switch" or self.path == "/api/profile/switch":
+            self._handle_hermes_profile_switch()
         else:
             self._json({"error": "Not found"}, 404)
 
