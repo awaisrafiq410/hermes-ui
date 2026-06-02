@@ -669,6 +669,7 @@
     margin: 0 0 12px 0; border: 1px solid rgba(124,111,224,0.28);
     background: linear-gradient(135deg, rgba(124,111,224,0.12), rgba(68,216,138,0.05));
     border-radius: 10px; overflow: hidden;
+    contain: layout paint;
   }
   .reasoning-card summary {
     cursor: pointer; padding: 8px 10px; color: var(--text-secondary);
@@ -677,7 +678,14 @@
   .reasoning-card-body {
     padding: 0 10px 10px 10px; color: var(--text-muted);
     font-family: 'Monaco', 'Menlo', monospace; font-size: 11px; line-height: 1.5;
-    white-space: pre-wrap;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .reasoning-card.streaming .reasoning-card-body {
+    height: 160px;
+    max-height: 160px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
   }
   .toolless-work-warning {
     margin: 0 0 10px 0;
@@ -4983,6 +4991,7 @@ function AsideBubble({ message, index }) {
 function MessageBubble({ message, onImageClick, onEdit, onRetry, index, highlighted }) {
   const isUser = message.role === 'user';
   const contentRef = useRef(null);
+  const reasoningRef = useRef(null);
   const [expandedTools, setExpandedTools] = useState({});
   const canRetry = !!(onRetry && !message.streaming && !message.thinking && (message.role === 'user' || message.role === 'assistant'));
 
@@ -5036,6 +5045,11 @@ function MessageBubble({ message, onImageClick, onEdit, onRetry, index, highligh
     });
     renderMermaidBlocks(contentRef.current);
   }, [message.content]);
+
+  useEffect(() => {
+    if (!message.streaming || !reasoningRef.current) return;
+    reasoningRef.current.scrollTop = reasoningRef.current.scrollHeight;
+  }, [message.streaming, reasoningText]);
 
   return (
     <div
@@ -5104,9 +5118,9 @@ function MessageBubble({ message, onImageClick, onEdit, onRetry, index, highligh
       )}
 
       {reasoningText && (
-        <details className="reasoning-card" open={message.streaming}>
+        <details className={"reasoning-card " + (message.streaming ? 'streaming' : '')} open={message.streaming}>
           <summary>Reasoning notes</summary>
-          <div className="reasoning-card-body">{reasoningText}</div>
+          <div ref={reasoningRef} className="reasoning-card-body">{reasoningText}</div>
         </details>
       )}
 
