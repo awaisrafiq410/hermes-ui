@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  hermes-ui:
+    build: .
+    container_name: hermes-ui
+    ports:
+      - "8780:8780"
+    volumes:
+      # Mounting the parent storage root directory as requested for real-time inspection
+      - /mnt/hdd_500gb/DATA/AppData/:/mnt/hdd_500gb/DATA/AppData/
+    networks:
+      - media-network
+    restart: unless-stopped
+
+networks:
+  media-network:
+    external: true
