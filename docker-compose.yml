@@ -9,6 +9,8 @@ services:
     volumes:
       # Mounting the parent storage root directory as requested for real-time inspection
       - /mnt/hdd_500gb/DATA/AppData/:/mnt/hdd_500gb/DATA/AppData/
+      # Mount the host's .hermes directory so the UI can import AIAgent and read session states
+      - ~/.hermes:/root/.hermes
     networks:
       - media-network
     restart: unless-stopped
