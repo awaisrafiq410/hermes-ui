@@ -6,11 +6,13 @@ services:
     container_name: hermes-ui
     ports:
       - "8780:8780"
+    environment:
+      # Tell the UI exactly where the agent and its states live on the mapped volume
+      - HERMES_HOME=/mnt/hdd_500gb/DATA/AppData/.hermes
+      - AGENT_DIR=/mnt/hdd_500gb/DATA/AppData/hermes-agent
     volumes:
       # Mounting the parent storage root directory as requested for real-time inspection
       - /mnt/hdd_500gb/DATA/AppData/:/mnt/hdd_500gb/DATA/AppData/
-      # Mount the host's .hermes directory so the UI can import AIAgent and read session states
-      - ~/.hermes:/root/.hermes
     networks:
       - media-network
     restart: unless-stopped
